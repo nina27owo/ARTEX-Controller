@@ -1,0 +1,15 @@
+# 本地配置与凭据（含明文密码，不要提交）
+config.toml
+config.toml.bak
+config.toml.tmp
+ssh_host_keys.json
+keys/
+machine/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 系统
+Thumbs.db
+.DS_Store

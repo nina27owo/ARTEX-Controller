@@ -1,0 +1,42 @@
+# ARTEX 控制台配置示例
+# 复制为 config.toml 后按需修改；config.toml 已被 .gitignore 忽略，不会被提交到仓库。
+
+[defaults]
+# 目标机器上 ARTEX 网页监听的端口（默认 8787）
+artex_port = 8787
+# ARTEX 网页登录账号 / 密码；机器单独填了账号密码的优先，这里作为全局默认
+login_user = "ARTEX"
+login_password = ""
+# 默认 LLM 标识（仅作记录，实际选择以服务器上的 LLM 配置为准）
+llm = ""
+# 单次任务默认时长（分钟）
+timeout_minutes = 600
+plan_heartbeat_minutes = 10
+coverage_enabled = true
+seed_first_intent = false
+test_prefix = "[DISPATCH-TEST]"
+# 命令行工具 artex_dispatch.py 的默认目标；网页控制台下发任务默认使用「获取权限」
+goal = """在此填写固定的任务目标模板。"""
+
+[console]
+# 控制台网页端口，打开 http://127.0.0.1:8900
+port = 8900
+# 界面语言：zh / en（也可在设置页面切换）
+lang = "zh"
+
+# 可选：LLM 显示名映射（不影响服务器端配置）
+# [[llm]]
+# key = "default"
+# label = "Default LLM"
+# model_match = "your-model-name"
+
+# 服务器一：启动后点左侧「＋ 添加」即可写入此段；也可手工照下面格式填写
+# [[machines]]
+# ip = "192.168.1.10"
+# label = "test-box"
+# user = "root"
+# port = 22
+# ssh_password = "your-ssh-password"
+# artex_port = 8787
+# artex_user = "ARTEX"
+# artex_password = "your-artex-web-password"
