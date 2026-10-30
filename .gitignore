@@ -5,6 +5,8 @@ config.toml.tmp
 ssh_host_keys.json
 keys/
 machine/
+ui_state.json
+ui_state.json.tmp
 
 # Python
 __pycache__/

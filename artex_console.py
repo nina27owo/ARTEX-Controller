@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ARTEX 本地总控制台（会话 + 任务下发 + 按需刷新）
+"""ARTEX 本地多机控制台。
 
-* 左侧 9 个会话（每台机器一个），右侧是该会话的操作面板
-* 「刷新」：**现连现断** —— 建 SSH 隧道 → 拉 /api/tasks → 立刻断开，不做常驻连接
-* 「下发」：同一套路，建连 → 建任务 → 断开，成功后自动刷新一次
-* 只监听 127.0.0.1，数据全部走 SSH 转发到各机 127.0.0.1:8787
+动态服务器列表、多机总览、常连接自动刷新与重连、任务下发、
+提问记录和报告导出；只监听 127.0.0.1，数据通过 SSH 转发。
 
 用法：
     python artex_console.py                 # 默认 http://127.0.0.1:8900
@@ -34,6 +32,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 import webbrowser
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -54,9 +53,10 @@ except ImportError:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = os.path.join(HERE, "config.toml")
-DEFAULT_GOAL = "获取权限"
+DEFAULT_GOAL = "获取权限"   # 仅在 config.toml 没写 goal 时兜底
 EXPORT_ROOT = os.path.join(HERE, "machine")
 KNOWN_HOSTS_FILE = os.path.join(HERE, "ssh_host_keys.json")
+UI_STATE_FILE = os.path.join(HERE, "ui_state.json")
 
 
 # --------------------------------------------------------------------------
@@ -336,6 +336,28 @@ def load_config(path):
     return cfg
 
 
+def console_options(cfg):
+    c = cfg.get("console") or {}
+    return {
+        "lang": c.get("lang", "zh"),
+        "theme": c.get("theme", "light"),
+        "refresh_seconds": int(c.get("refresh_seconds", 8)),
+        "background_refresh_seconds": int(c.get("background_refresh_seconds", 30)),
+        "auto_connect": bool(c.get("auto_connect", False)),
+        "auto_reconnect": bool(c.get("auto_reconnect", True)),
+        "reconnect_seconds": int(c.get("reconnect_seconds", 15)),
+        "ssh_timeout": int(c.get("ssh_timeout", 12)),
+        "desktop_notifications": bool(c.get("desktop_notifications", False)),
+        "export_dir": c.get("export_dir", "machine"),
+    }
+
+
+def apply_export_dir(cfg):
+    global EXPORT_ROOT
+    value = (cfg.get("console") or {}).get("export_dir", "machine")
+    EXPORT_ROOT = os.path.abspath(os.path.join(HERE, value))
+
+
 _CONFIG_PATH = DEFAULT_CONFIG
 
 
@@ -390,6 +412,91 @@ def save_config(cfg, path=None):
     with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         f.write(dump_config(cfg))
     os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------
+# 本机界面状态：每台机器的「最近任务」顺序（与配置、凭据分开保存）
+# --------------------------------------------------------------------------
+
+_UI_STATE = None
+_UI_LOCK = threading.Lock()
+
+
+def _ui_state():
+    global _UI_STATE
+    if _UI_STATE is None:
+        try:
+            with open(UI_STATE_FILE, "r", encoding="utf-8") as f:
+                _UI_STATE = json.load(f) or {}
+        except Exception:
+            _UI_STATE = {}
+    return _UI_STATE
+
+
+def _ui_flush():
+    tmp = UI_STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_ui_state(), f, indent=1, ensure_ascii=False)
+    os.replace(tmp, UI_STATE_FILE)
+
+
+def get_task_order(ip):
+    with _UI_LOCK:
+        order = (_ui_state().get("task_order") or {}).get(ip) or []
+        return [str(x) for x in order]
+
+
+def set_task_order(ip, order):
+    with _UI_LOCK:
+        _ui_state().setdefault("task_order", {})[ip] = list(order)
+        try:
+            _ui_flush()
+        except Exception:
+            return False
+    return True
+
+
+def move_task_order(old_ip, new_ip):
+    with _UI_LOCK:
+        orders = _ui_state().setdefault("task_order", {})
+        if old_ip in orders:
+            orders[new_ip] = orders.pop(old_ip)
+            try:
+                _ui_flush()
+            except Exception:
+                pass
+
+
+def drop_task_order(ip):
+    with _UI_LOCK:
+        orders = _ui_state().setdefault("task_order", {})
+        if orders.pop(ip, None) is not None:
+            try:
+                _ui_flush()
+            except Exception:
+                pass
+
+
+def get_ask_history(ip, task_id):
+    with _UI_LOCK:
+        items = (((_ui_state().get("ask_history") or {}).get(ip) or {}).get(str(task_id)) or [])
+        return list(items)
+
+
+def append_ask_history(ip, task_id, message, result):
+    entry = {"message": message, "ok": bool(result.get("ok")),
+             "reply": result.get("reply") or result.get("error") or "",
+             "ts": int(time.time())}
+    with _UI_LOCK:
+        by_ip = _ui_state().setdefault("ask_history", {}).setdefault(ip, {})
+        items = by_ip.setdefault(str(task_id), [])
+        items.append(entry)
+        del items[:-20]
+        try:
+            _ui_flush()
+        except Exception:
+            pass
+    return entry
 
 
 def safe_filename(ip):
@@ -451,6 +558,7 @@ def open_persistent(cfg, machine, password):
         tunnel = SSHTunnel(machine["ip"], machine["user"], password,
                            remote_port=int(machine.get("artex_port") or d.get("artex_port", 8787)),
                            port=int(machine.get("port", 22)),
+                           timeout=int((cfg.get("console") or {}).get("ssh_timeout", 12)),
                            key_file=key_file)
         tunnel.start()
         client = ArtexClient("http://127.0.0.1:%d" % tunnel.local_port,
@@ -505,6 +613,7 @@ class Session:
             self.tunnel = SSHTunnel(self.m["ip"], self.m["user"], self.password,
                                     remote_port=int(self.m.get("artex_port") or self.d.get("artex_port", 8787)),
                                     port=int(self.m.get("port", 22)),
+                                    timeout=int((self.cfg.get("console") or {}).get("ssh_timeout", 12)),
                                     key_file=self.key_file)
             self.tunnel.start()
             self.client = ArtexClient("http://127.0.0.1:%d" % self.tunnel.local_port,
@@ -569,13 +678,13 @@ def summarize(tasks):
             "in_flight": int(t.get("in_flight") or 0),
             "findings": {k: int(f.get(k) or 0) for k in findings},
         })
-    # 只展示 ID 最大的 5 个任务（即最新创建的 5 个）
     rows.sort(key=_task_num, reverse=True)
-    all_tasks = [{"id": r["id"], "name": r["name"], "status": r["status"]} for r in rows[:80]]
+    all_tasks = [{"id": r["id"], "name": r["name"], "status": r["status"],
+                  "in_flight": r["in_flight"], "findings": r["findings"]}
+                 for r in rows]
     return {
         "tasks_total": len(tasks), "counts": counts, "findings": findings,
         "in_flight": inflight, "last_activity": last,
-        "active": rows[:5], "active_total": len(tasks),
         "all_tasks": all_tasks,
     }
 
@@ -602,27 +711,28 @@ def _safe_extract(zip_path, dest):
     return count
 
 
-def export_task(client, ip, task_id, task_name):
-    """导出到 <程序目录>/machine/<ip>/<任务名>/：
-       总报告.md + 严重/*.md + 高危/*.md + 导出信息.txt
-    """
+def export_task(client, ip, task_id, task_name, progress=None):
+    """导出总报告与严重/高危单漏洞报告，并回报当前阶段。"""
     tid = str(task_id).strip()
     base = os.path.join(EXPORT_ROOT,
                         _safe_dirname(ip, "unknown-ip"),
                         _safe_dirname(task_name, "task_" + tid))
     os.makedirs(base, exist_ok=True)
-    res = {"critical": 0, "high": 0, "errors": []}
+    res = {"critical": 0, "high": 0, "main_report": 0, "errors": []}
 
-    # 1) 总报告（任务级 Markdown）
+    if progress:
+        progress("report")
     st, data, _ = client.raw("/api/report?task=" + tid)
     if st == 200 and data:
         with open(os.path.join(base, "总报告.md"), "wb") as f:
             f.write(data)
+        res["main_report"] = 1
     else:
         res["errors"].append("总报告 HTTP %s" % st)
 
-    # 2) 严重 / 高危：每个漏洞一个 md（服务端打包 zip，这里解压）
     for sev, label, key in (("critical", "严重", "critical"), ("high", "高危", "high")):
+        if progress:
+            progress(sev)
         q = ("/api/exploration/findings/export?scope=filtered&task_id=%s"
              "&severity=%s&format=md-zip" % (tid, sev))
         st, data, _ = client.raw(q, timeout=180)
@@ -640,6 +750,8 @@ def export_task(client, ip, task_id, task_name):
         res[key] = _safe_extract(tmp, dest)
         os.remove(tmp)
 
+    if progress:
+        progress("finishing")
     with open(os.path.join(base, "导出信息.txt"), "w", encoding="utf-8") as f:
         f.write("任务 #%s  %s\n" % (tid, task_name))
         f.write("导出时间：%s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -733,6 +845,10 @@ def ask_main_agent(client, task_id, message, timeout=240):
     return {"ok": True, "reply": reply, "steps": steps[-40:]}
 
 
+_EXPORT_JOBS = {}
+_EXPORT_LOCK = threading.Lock()
+
+
 # --------------------------------------------------------------------------
 # 页面
 # --------------------------------------------------------------------------
@@ -810,8 +926,17 @@ HTML = r"""<!DOCTYPE html>
   body.collapsed .item .dot{margin-top:0}
   .side-actions{padding:0 14px 10px;display:flex;flex-direction:column;gap:5px}
   .side-actions .row{gap:6px;margin:0}
+  .side-actions .row button{flex:1}
+  #btn-add{background:var(--accent);border-color:var(--accent-d);color:#fdfaf4;
+           box-shadow:0 1px 2px rgba(125,85,51,.2)}
+  #btn-add:hover{background:var(--accent-d)}
+  body.dark #btn-add{color:#231e18}
   .side-foot{display:flex;gap:6px;padding:8px 14px 10px;border-top:1px solid var(--line)}
-  .foot-btn{flex:1;height:30px;display:flex;align-items:center;justify-content:center;padding:0}
+  .foot-btn{flex:1;height:30px;display:flex;align-items:center;justify-content:center;padding:0;
+            background:rgba(253,250,244,.45);border-color:var(--line-soft);border-radius:7px}
+  .foot-btn:hover{background:#fffdf8}
+  body.dark .foot-btn{background:rgba(255,255,255,.03)}
+  body.dark .foot-btn:hover{background:#362e25}
   .foot-btn svg{display:block}
   #ico-sun{display:none}
   body.dark #ico-sun{display:block}
@@ -841,14 +966,20 @@ HTML = r"""<!DOCTYPE html>
     border-left:3px solid transparent;transition:background .12s ease;
   }
   .item:hover{background:rgba(255,255,255,.55)}
-  .item.on{background:#fffdf8;border-left-color:var(--accent);box-shadow:0 1px 0 rgba(150,104,63,.06)}
+  .item.on{background:linear-gradient(90deg,#fffdf8 0%,#f8f1e3 100%);
+           border-left-color:var(--accent);box-shadow:0 1px 0 rgba(150,104,63,.06)}
+  .item.on .ip{color:var(--accent)}
   .item .ip{font-size:13px;font-weight:500;letter-spacing:.2px;color:var(--ink)}
   .item .lb{font-size:11px;color:var(--ink-3);letter-spacing:.2px}
-  .dot{width:7px;height:7px;border-radius:50%;flex:none;margin-top:6px;box-shadow:0 0 0 2px rgba(255,255,255,.7)}
+  .dot{position:relative;width:7px;height:7px;border-radius:50%;flex:none;margin-top:6px;
+       box-shadow:0 0 0 2px rgba(255,255,255,.7)}
   .d0{background:#cfc3b1}.d1{background:#6fa07c}.d2{background:#c1705c}
+  .dot.d1:after{content:"";position:absolute;inset:-3px;border-radius:50%;
+                border:1.5px solid rgba(111,160,124,.45);animation:dotRing 2.4s ease-out infinite}
+  @keyframes dotRing{0%{transform:scale(.65);opacity:.85}100%{transform:scale(1.7);opacity:0}}
 
   main{flex:1;min-width:0;overflow-y:auto;overflow-x:hidden;padding:18px 24px 28px}
-  #tasks{overflow-x:auto}
+  #tasks{overflow:auto;max-height:min(56vh,470px);border-radius:7px}
 
   .hdr{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
        padding-bottom:13px;margin-bottom:18px;border-bottom:1px solid var(--line-soft)}
@@ -882,23 +1013,35 @@ HTML = r"""<!DOCTYPE html>
   .field label{font-size:11px;letter-spacing:.4px;color:var(--ink-3)}
   .auto{font-size:13px;color:var(--ink-2);padding:7px 0;letter-spacing:.2px}
 
-  .chips{display:flex;gap:10px;flex-wrap:wrap;margin:2px 0 16px}
+  .chips{display:flex;gap:10px;flex-wrap:wrap;margin:2px 0 18px}
   .chip{
-    background:var(--panel);border:1px solid var(--line);border-radius:9px;
-    padding:7px 14px 8px;min-width:82px;box-shadow:0 1px 2px rgba(120,95,60,.05);
+    position:relative;overflow:hidden;
+    background:var(--panel);
+    background:linear-gradient(180deg,color-mix(in srgb,var(--c) 8%,var(--panel)) 0%,var(--panel) 72%);
+    border:1px solid var(--line);border-radius:10px;
+    padding:9px 15px;min-width:86px;box-shadow:0 1px 2px rgba(120,95,60,.05);
+    transition:transform .14s ease,box-shadow .14s ease;
   }
+  .chip:before{content:"";position:absolute;left:13px;right:13px;top:0;height:3px;
+               border-radius:0 0 3px 3px;background:var(--c);opacity:.7}
+  .chip:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(120,95,60,.10)}
   .chip .k{font-size:10.5px;letter-spacing:.4px;color:var(--ink-3)}
-  .chip .v{font-size:18px;font-weight:600;line-height:1.25;font-variant-numeric:tabular-nums}
+  .chip .v{font-size:19px;font-weight:600;line-height:1.25;color:var(--c);font-variant-numeric:tabular-nums}
 
-  table{width:100%;border-collapse:collapse}
-  th,td{padding:7px 10px;text-align:left;white-space:nowrap}
+  table{width:100%;border-collapse:separate;border-spacing:0}
+  th,td{padding:8px 10px;text-align:left;white-space:nowrap}
   th{
-    font-size:11px;font-weight:500;letter-spacing:.5px;color:var(--ink-3);
-    border-bottom:1px solid var(--line);background:transparent;
+    position:sticky;top:0;z-index:2;
+    font-size:10.5px;font-weight:600;letter-spacing:.7px;color:var(--ink-3);
+    border-bottom:1px solid var(--line);background:var(--panel-2);
   }
+  th:first-child{border-radius:7px 0 0 7px}
+  th:last-child{border-radius:0 7px 7px 0}
   td{font-size:12.5px;color:var(--ink);border-bottom:1px solid var(--line-soft)}
+  tbody tr{transition:background .12s ease}
   tbody tr:last-child td{border-bottom:none}
   tbody tr:hover td{background:rgba(255,255,255,.55)}
+  tbody tr:hover td:first-child{box-shadow:inset 3px 0 0 rgba(150,104,63,.35)}
   .num{text-align:right;font-variant-numeric:tabular-nums}
 
   .c-critical{color:var(--crit);font-weight:600}
@@ -919,22 +1062,23 @@ HTML = r"""<!DOCTYPE html>
     box-shadow:0 1px 3px rgba(120,95,60,.05);
   }
   .sec h3{
-    display:flex;align-items:center;gap:8px;margin:0 0 12px;
+    display:flex;align-items:center;flex-wrap:wrap;row-gap:6px;gap:8px;margin:0 0 12px;
     font-size:11.5px;font-weight:600;letter-spacing:.8px;color:var(--ink-2);
   }
   .sec h3 .sp{flex:1}
   button.mini{width:auto;padding:3px 11px;font-size:11.5px;letter-spacing:.2px}
   #tasks tbody tr{cursor:pointer}
   #tasks td.ops,#tasks th.ops{text-align:right;white-space:nowrap}
-  #tasks td.ops button{margin-left:5px}
+  #tasks td.ops button{margin-left:5px;padding:2px 10px;font-size:11px}
   #tasks tbody tr.sel td{background:#f7efdf}
   #tasks tbody tr.sel td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
   .sec h3 .muted{font-weight:400;letter-spacing:0}
 
   .tag{
-    display:inline-block;padding:1px 8px;border-radius:9px;font-size:11px;
+    display:inline-flex;align-items:center;gap:5px;padding:1px 8px;border-radius:9px;font-size:11px;
     background:var(--line-soft);color:var(--ink-2);letter-spacing:.2px;
   }
+  .tag i{width:5px;height:5px;border-radius:50%;background:currentColor;opacity:.65;flex:none}
   .s-running{background:#e2efe5;color:#3f6b4d}
   .s-paused{background:#f7ecd2;color:#8a6a2a}
   .s-queued,.s-created{background:#eae4d8;color:#7b6f61}
@@ -1016,6 +1160,143 @@ HTML = r"""<!DOCTYPE html>
   body.dark .rule{background:linear-gradient(90deg,rgba(80,66,50,0),rgba(90,75,56,.9),rgba(80,66,50,0))}
   body.dark *{scrollbar-color:#4a4036 transparent}
   body.dark ::-webkit-scrollbar-thumb{background:#4a4036;border-radius:4px;border:2px solid transparent;background-clip:content-box}
+
+  /* —— 「全部任务」与全局细节 —— */
+  .modal{backdrop-filter:blur(3px);animation:modalFade .15s ease}
+  .modal-box{animation:modalPop .18s ease-out}
+  @keyframes modalFade{from{opacity:0}}
+  @keyframes modalPop{from{opacity:0;transform:translateY(8px) scale(.985)}}
+
+  #btn-all{display:inline-flex;align-items:center;gap:6px}
+  #btn-all svg{opacity:.7}
+  #btn-all .cnt{min-width:18px;padding:0 6px;border-radius:8px;background:var(--panel-2);
+                color:var(--ink-2);font-size:10.5px;line-height:16px;text-align:center;
+                font-variant-numeric:tabular-nums}
+  #btn-all:disabled .cnt{opacity:.6}
+
+  .tasks-box{width:min(620px,94vw);padding:18px 20px 16px}
+  .modal-head{display:flex;align-items:flex-start;gap:12px;margin-bottom:10px}
+  .modal-head h3{margin:0;font-size:14px;font-weight:600;letter-spacing:.4px;color:var(--ink)}
+  .modal-sub{font-size:11.5px;color:var(--ink-3);margin-top:3px;line-height:1.5}
+  .modal-head .icon{margin-left:auto;flex:none;border-radius:7px;height:26px}
+  .tlist{max-height:min(56vh,520px);overflow-y:auto;margin:2px -4px 0;padding:0 4px}
+  .trow{display:flex;align-items:center;gap:9px;padding:8px 10px;margin-bottom:6px;
+        border:1px solid var(--line-soft);border-radius:8px;background:var(--panel);
+        cursor:grab;user-select:none;
+        transition:background .12s ease,border-color .12s ease,box-shadow .12s ease}
+  .trow:hover{border-color:var(--line);box-shadow:0 1px 3px rgba(120,95,60,.06)}
+  .trow.on{background:#fbf6eb;border-color:#eadcc6}
+  .trow.dragging{opacity:.45;border-style:dashed;cursor:grabbing}
+  .grip{width:10px;height:16px;flex:none;color:var(--ink-3);opacity:.65;
+        background-image:radial-gradient(currentColor 1px,transparent 1.2px);
+        background-size:5px 5px;background-position:0 1px}
+  .rank{width:20px;height:20px;line-height:20px;flex:none;border-radius:50%;
+        background:var(--panel-2);color:var(--ink-3);font-size:10.5px;text-align:center;
+        font-variant-numeric:tabular-nums}
+  .trow.on .rank{background:var(--accent);color:#fdfaf4}
+  .tid{flex:none;font-size:11px;color:var(--ink-3);font-variant-numeric:tabular-nums}
+  .tname{flex:1;min-width:0;font-size:12.5px;color:var(--ink);
+         overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .trow .tag{flex:none}
+  .tshow{flex:none;padding:0 6px;border:1px solid rgba(150,104,63,.35);border-radius:8px;
+         color:var(--accent);font-size:10px;letter-spacing:.3px}
+  .tcut{display:flex;align-items:center;gap:8px;margin:8px 2px 7px;
+        color:var(--ink-3);font-size:10.5px;letter-spacing:.2px}
+  .tcut:before,.tcut:after{content:"";height:1px;background:var(--line);flex:1}
+  .modal-foot{display:flex;align-items:center;gap:10px;margin-top:12px;padding-top:12px;
+              border-top:1px solid var(--line-soft)}
+  .modal-foot .sp{flex:1}
+  .t-empty{display:flex;flex-direction:column;align-items:center;gap:7px;
+           padding:30px 0 26px;color:var(--ink-3);font-size:12px}
+  .t-empty svg{opacity:.45}
+
+  .toast{position:fixed;left:50%;bottom:26px;z-index:80;transform:translate(-50%,12px);
+         padding:8px 16px;border-radius:20px;background:#3d342a;color:#fdf8ee;
+         font-size:12.5px;letter-spacing:.2px;box-shadow:0 8px 24px rgba(60,45,30,.28);
+         opacity:0;pointer-events:none;transition:opacity .18s ease,transform .18s ease}
+  .toast.show{opacity:1;transform:translate(-50%,0)}
+
+  :focus-visible{outline:2px solid rgba(150,104,63,.45);outline-offset:2px}
+  input:focus-visible,select:focus-visible,textarea:focus-visible{outline:none}
+
+  body.dark .trow{background:#241f18}
+  body.dark .trow:hover{border-color:#463a2c;box-shadow:none}
+  body.dark .trow.on{background:#2f2820;border-color:#4a3c2c}
+  body.dark .trow.on .rank{color:#231e18}
+  body.dark #tasks tbody tr.sel td{background:#332b22}
+  body.dark .toast{background:#e6dccc;color:#231e18;box-shadow:0 8px 24px rgba(0,0,0,.45)}
+  body.dark .dot.d1:after{border-color:rgba(131,177,142,.5)}
+  body.dark .chip{background:var(--panel);
+                  background:linear-gradient(180deg,color-mix(in srgb,var(--c) 12%,var(--panel)) 0%,var(--panel) 72%)}
+
+  button{position:relative;overflow:hidden;transform:translateY(0);transition:background .14s ease,box-shadow .14s ease,transform .14s ease}
+  button:hover:not(:disabled){transform:translateY(-1px)}
+  button:active:not(:disabled){transform:translateY(1px) scale(.985)}
+  .ripple{position:absolute;border-radius:50%;background:currentColor;opacity:.13;pointer-events:none;
+          transform:scale(0);animation:rippleOut .45s ease-out}
+  @keyframes rippleOut{to{transform:scale(3);opacity:0}}
+  .view-enter{animation:viewIn .22s ease-out}
+  @keyframes viewIn{from{opacity:0;transform:translateY(5px)}}
+  .modal.closing{animation:modalOut .14s ease forwards}
+  .modal.closing .modal-box{animation:modalBoxOut .14s ease forwards}
+  @keyframes modalOut{to{opacity:0}}
+  @keyframes modalBoxOut{to{opacity:0;transform:translateY(6px) scale(.985)}}
+  button.chip{font:inherit;text-align:left;cursor:pointer;color:var(--ink);transform:translateY(0)}
+  button.chip:active:not(:disabled){transform:translateY(1px) scale(.985)}
+  .chip.active{border-color:var(--c);box-shadow:0 0 0 2px color-mix(in srgb,var(--c) 16%,transparent),0 5px 15px rgba(120,95,60,.10)}
+  .chip.active:after{content:"✓";position:absolute;right:9px;bottom:8px;color:var(--c);font-size:10px;font-weight:700}
+  .chip .v{transition:transform .18s ease}
+  .chip.bump .v{animation:valueBump .25s ease}
+  @keyframes valueBump{50%{transform:translateY(-2px) scale(1.08)}}
+  .state-icon{width:44px;height:44px;border:1px solid var(--line);border-radius:50%;display:grid;place-items:center;
+              color:var(--accent);font-size:24px;margin-bottom:14px;background:var(--panel)}
+  .state-title{font-size:14px;color:var(--ink-2);margin-bottom:4px}.placeholder{min-height:42vh;text-align:center}
+  .skeleton{display:flex;gap:8px;margin-top:22px}.skeleton i{width:72px;height:7px;border-radius:5px;background:var(--line);
+              animation:skeletonPulse 1.1s ease-in-out infinite alternate}.skeleton i:nth-child(2){animation-delay:.18s}.skeleton i:nth-child(3){animation-delay:.36s}
+  @keyframes skeletonPulse{to{opacity:.3;transform:scaleX(.8)}}
+  .empty-table{display:flex;align-items:center;justify-content:center;gap:9px;min-height:80px;color:var(--ink-3);
+               border:1px dashed var(--line);border-radius:8px;background:color-mix(in srgb,var(--panel-2) 45%,transparent)}
+  .empty-table:before{content:"◇";font-size:18px;opacity:.6}
+  .overview-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(265px,1fr));gap:14px}
+  .machine-card{position:relative;text-align:left;padding:16px 17px;border:1px solid var(--line);border-radius:12px;
+                background:var(--panel);color:var(--ink);cursor:pointer;box-shadow:0 2px 7px rgba(120,95,60,.05);
+                transition:transform .16s,border-color .16s,box-shadow .16s;animation:viewIn .22s ease both}
+  .machine-card:hover{transform:translateY(-3px);border-color:#cfb99b;box-shadow:0 8px 22px rgba(120,95,60,.11)}
+  .machine-card .mc-head{display:flex;align-items:center;gap:8px}.machine-card .mc-ip{font-weight:600;font-size:14px}
+  .machine-card .mc-label{font-size:11px;color:var(--ink-3);margin:2px 0 13px}.machine-card .mc-stats{display:grid;
+                grid-template-columns:repeat(4,1fr);gap:8px}.machine-card .mc-stat{padding:7px 4px;border-radius:7px;
+                background:var(--panel-2);text-align:center}.machine-card .mc-stat b{display:block;font-size:17px;line-height:1.3}
+  .machine-card .mc-stat span{font-size:10px;color:var(--ink-3)}.machine-card .mc-foot{margin-top:12px;font-size:11px;color:var(--ink-3)}
+  .machine-card .mc-error{margin-top:10px;color:var(--crit);font-size:11px;white-space:normal}
+  .unread{display:inline-flex;align-items:center;justify-content:center;min-width:17px;height:17px;padding:0 5px;
+          border-radius:9px;background:var(--crit);color:#fff;font-size:9.5px;line-height:1;margin-left:5px;animation:unreadPop .25s ease}
+  @keyframes unreadPop{from{transform:scale(.4);opacity:0}}
+  .item .unread{position:absolute;right:12px;top:10px}.item{position:relative}.item .ops{position:relative;z-index:2}
+  .task-unread{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--crit);margin-left:6px;box-shadow:0 0 0 3px color-mix(in srgb,var(--crit) 12%,transparent)}
+  .progress{height:5px;border-radius:4px;background:var(--line-soft);overflow:hidden;margin-top:12px}
+  .progress>div{height:100%;width:12%;border-radius:inherit;background:var(--accent);transition:width .35s ease}
+  .progress.indeterminate>div{animation:progressSlide 1.15s ease-in-out infinite}
+  @keyframes progressSlide{0%{transform:translateX(-100%)}100%{transform:translateX(850%)}}
+  .ask-history{margin-top:12px}.ask-history details{border:1px solid var(--line-soft);border-radius:8px;margin-top:7px;
+               background:color-mix(in srgb,var(--panel-2) 45%,transparent);overflow:hidden;animation:viewIn .18s ease}
+  .ask-history summary{padding:8px 11px;color:var(--ink-2)}.ask-history .qa{padding:0 11px 10px;white-space:pre-wrap;
+               word-break:break-word;font-size:12px}.ask-history .qa b{display:block;color:var(--accent);margin:5px 0 2px}
+  #btn-mobile-side{display:none;margin-bottom:10px}#side-scrim{position:fixed;inset:0;background:rgba(30,22,15,.35);z-index:25}
+  @media(max-width:1050px){.chips{display:grid;grid-template-columns:repeat(4,minmax(0,1fr))}.chip{min-width:0}}
+  @media(max-width:760px){
+    aside{position:fixed;left:0;top:0;bottom:0;z-index:30;width:min(270px,82vw);transform:translateX(-102%);transition:transform .2s ease;box-shadow:8px 0 30px rgba(50,35,20,.16)}
+    body.mobile-side aside{transform:translateX(0)}body.collapsed aside{width:min(270px,82vw)}
+    body.collapsed .side-brand,body.collapsed .side-title,body.collapsed .side-actions{display:block}
+    body.collapsed .item{justify-content:flex-start;padding:9px 16px;border-left-width:3px}
+    body.collapsed .item .ip,body.collapsed .item .lb,body.collapsed .item .ops{display:block}
+    #btn-mobile-side{display:block}main{padding:14px 15px 24px}.hdr{margin-bottom:14px}.overview-grid{grid-template-columns:1fr}
+    .modal-box{max-height:92vh;overflow:auto}.tasks-box{padding:16px 14px}.trow .tag{display:none}
+  }
+  @media(max-width:520px){.chips{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.chip{padding:9px 12px}.hdr h1{font-size:14px}
+    #p-time{width:100%;order:5}.row{gap:10px}.wordmark{font-size:42px;letter-spacing:10px;text-indent:10px}.trow .tid{display:none}}
+  @media (prefers-reduced-motion: reduce){
+    *,*:before,*:after{animation:none !important;transition:none !important}
+  }
 </style>
 </head>
 <body>
@@ -1037,6 +1318,7 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <div class="side-title" data-i18n="servers">服务器列表</div>
     <div class="side-actions">
+      <button id="btn-overview" class="mini ghost" data-i18n="overview">全部服务器</button>
       <div class="row">
         <button id="btn-add" class="mini ghost" data-i18n="add">＋ 添加</button>
         <button id="btn-edit" class="mini ghost" data-i18n="edit">编辑</button>
@@ -1065,7 +1347,15 @@ HTML = r"""<!DOCTYPE html>
       </button>
     </div>
   </aside>
+  <div id="side-scrim" hidden></div>
   <main>
+    <button id="btn-mobile-side" class="icon" title="服务器列表" data-i18n-title="servers">☰</button>
+    <div id="overview" hidden>
+      <div class="hdr"><h1 data-i18n="overview">全部服务器</h1><span class="muted" id="o-time"></span><span class="spacer"></span>
+        <button id="btn-refresh-all" class="ghost" data-i18n="refresh_all">刷新全部</button></div>
+      <div class="chips" id="o-chips"></div>
+      <div id="o-cards" class="overview-grid"></div>
+    </div>
     <div id="empty" class="empty"><div class="slogan"><div class="wordmark">ARTEX</div><div class="wordmark-sub">CONTROLLER</div><div class="rule"></div><div class="tagline">Easy to wire, built to control.</div></div></div>
     <div id="panel" hidden>
       <div class="hdr">
@@ -1079,20 +1369,36 @@ HTML = r"""<!DOCTYPE html>
         </label>
         <span id="conn-label" class="muted" style="font-size:11.5px;min-width:92px">未连接</span>
       </div>
-      <div id="p-err" class="err" hidden></div>
-      <div id="p-placeholder" class="placeholder" hidden><div class="slogan"><div class="wordmark">ARTEX</div><div class="wordmark-sub">CONTROLLER</div><div class="rule"></div><div class="tagline">Easy to wire, built to control.</div></div></div>
+      <div id="p-err" class="err" hidden><div id="p-err-text"></div><details><summary data-i18n="error_details">详细原因</summary><pre id="p-err-detail"></pre></details></div>
+      <div id="p-placeholder" class="placeholder" hidden>
+        <div class="state-icon">⌁</div><div id="p-state-title" class="state-title" data-i18n="empty_title">选择右上角开关建立连接</div>
+        <div id="p-state-sub" class="muted" data-i18n="empty_hint">连接成功后会自动加载任务与漏洞概览</div>
+        <div id="connect-skeleton" class="skeleton" hidden><i></i><i></i><i></i></div>
+      </div>
       <div id="p-body" hidden>
         <div class="chips" id="chips"></div>
         <div class="sec">
           <h3><span data-i18n="recent_tasks">最近任务</span> <span class="muted" id="t-note"></span><span class="sp"></span>
+            <button id="btn-all" class="ghost mini" disabled data-i18n-title="all_tasks_title">
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor"
+                   stroke-width="2" stroke-linecap="round">
+                <path d="M8 6h12M8 12h12M8 18h12"></path>
+                <circle cx="4" cy="6" r="1.2" fill="currentColor" stroke="none"></circle>
+                <circle cx="4" cy="12" r="1.2" fill="currentColor" stroke="none"></circle>
+                <circle cx="4" cy="18" r="1.2" fill="currentColor" stroke="none"></circle>
+              </svg>
+              <span data-i18n="all_tasks">全部任务</span><span class="cnt" id="all-count">0</span>
+            </button>
             <button id="btn-export" class="ghost mini" disabled data-i18n="export">导出报告</button></h3>
           <div id="tasks"></div>
+          <div id="exp-progress" class="progress" hidden><div id="exp-bar"></div></div>
           <div id="exp-msg" class="muted" style="margin-top:8px;font-size:12px"></div>
         </div>
 
         <div class="sec" id="ask-sec" hidden>
           <h3><span data-i18n="ask_main">提问主 Agent</span> · <span id="ask-title" style="color:var(--ink)"></span>
             <span class="sp"></span>
+            <button id="btn-copy-reply" class="ghost mini" hidden data-i18n="copy_reply">复制回复</button>
             <span id="ask-status" class="muted"></span>
           </h3>
           <textarea id="ask-msg" rows="3" placeholder="输入要给主 Agent 的指令或问题，Ctrl+Enter 发送" data-i18n-ph="ask_ph"></textarea>
@@ -1101,6 +1407,7 @@ HTML = r"""<!DOCTYPE html>
             <span class="muted" style="font-size:11.5px" data-i18n="ask_hint">点任务行右侧「提问」切换目标任务</span>
           </div>
           <div id="ask-reply" class="reply" hidden></div>
+          <div id="ask-history" class="ask-history"></div>
         </div>
       </div>
       <div class="sec" id="dispatch-sec" hidden>
@@ -1241,8 +1548,30 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<div id="t-modal" class="modal" hidden>
+  <div class="modal-box tasks-box">
+    <div class="modal-head">
+      <div>
+        <h3 data-i18n="all_tasks">全部任务</h3>
+        <div class="modal-sub"><span id="t-sub-ip"></span> · <span id="t-sub"></span></div>
+      </div>
+      <button id="t-close" class="icon" title="关闭" data-i18n-title="close">✕</button>
+    </div>
+    <div id="t-list" class="tlist"></div>
+    <div class="modal-foot">
+      <span id="t-msg" class="muted" style="font-size:11.5px"></span>
+      <span class="sp"></span>
+      <button id="t-cancel" class="ghost" data-i18n="cancel">取消</button>
+      <button id="t-save" data-i18n="save">保存</button>
+    </div>
+  </div>
+</div>
+<div id="toast" class="toast"></div>
+
 <script>
 let MACHINES = [], CUR = null, CFG = {}, PWD = {}, REFRESHED = {}, SEL = null, ASK = null;
+let T_ORDER = null, T_ORIG = '', DRAG_ID = null, FILTER = null, OVERVIEW = false;
+let WANTED = {}, RECONNECT = {}, UNREAD = {}, TASK_UNREAD = {}, EXPORTING = {}, EXPORT_RESULTS = {};
 const $ = id => document.getElementById(id);
 const esc = s => String(s==null?"":s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
@@ -1259,7 +1588,14 @@ const I18N = {
     refreshed_at: '刷新于 ',
     tasks_total: '任务', running: '运行中', paused: '暂停', critical: '严重',
     high: '高危', medium: '中危', low: '低危', intent: '意图',
-    tasks_note: '（按 ID 倒序，最新 {1} 个 / 共 {2} 个）',
+    tasks_note: '（显示 {1} 个 / 共 {2} 个）',
+    tasks_note_custom: '（自定义顺序 · 显示 {1} / 共 {2}）',
+    all_tasks: '全部任务', all_tasks_title: '查看全部任务并调整展示顺序',
+    all_sub: '共 {1} 个任务 · 拖动任务块调整顺序，前 5 个显示在「最近任务」',
+    all_sub_short: '共 {1} 个任务',
+    cut_label: '以上 5 项显示在「最近任务」', show_badge: '展示中',
+    drag_hint: '拖动任务块调整顺序', order_dirty: '顺序已调整，点「保存」后长期生效',
+    order_saved: '✓ 展示顺序已保存', order_fail: '顺序保存失败', close: '关闭',
     th_task: '任务', th_status: '状态', ask: '提问',
     no_tasks: '这台机器还没有任务',
     st_running: '运行中', st_paused: '暂停', st_queued: '排队中', st_created: '已创建',
@@ -1304,7 +1640,19 @@ const I18N = {
     dispatched: '✓ 已下发 任务 #{1}（{2}）', dispatch_failed: '下发失败',
     request_failed_short: '✗ 请求失败',
     paused_ok: '✓ 任务 #{1} 已暂停', resumed_ok: '✓ 任务 #{1} 已继续', queued: '（排队中）',
-    op_failed: '操作失败', active_mark: '（激活）'
+    op_failed: '操作失败', active_mark: '（激活）',
+    overview: '全部服务器', refresh_all: '刷新全部', refreshing_all: '刷新中…',
+    machines_online: '在线机器', findings_total: '严重 + 高危', no_machines: '还没有服务器，请先添加',
+    no_saved_credentials: '未保存凭据', click_machine: '点击查看机器', never_refreshed: '尚未刷新',
+    empty_title: '选择右上角开关建立连接', empty_hint: '连接成功后会自动加载任务与漏洞概览',
+    connecting_body: '正在建立 SSH 隧道并登录 ARTEX…', filter_note: '筛选：{1} · {2} 个任务',
+    reconnecting: '等待重连', reconnect_in: '第 {1} 次重连 · {2}s', reconnect_done: '✓ {1} 已重新连接',
+    poll_failed: '刷新失败：', new_findings: '{1} 新增严重/高危 {2} 个',
+    copy_reply: '复制回复', copied: '✓ 已复制', ask_history: '历史提问', no_history: '暂无历史提问',
+    question: '问题', answer: '回复', export_report_step: '正在导出总报告…',
+    export_critical_step: '正在导出严重漏洞报告…', export_high_step: '正在导出高危漏洞报告…',
+    export_finishing: '正在整理导出结果…', export_failed: '导出失败', export_partial: '部分报告失败：{1} 个',
+    export_running: '该任务已有导出正在进行', task_unread: '有新发现', error_details: '详细原因'
   },
   en: {
     sub_local: 'Local only · auto-refresh',
@@ -1317,7 +1665,14 @@ const I18N = {
     refreshed_at: 'Updated ',
     tasks_total: 'Tasks', running: 'Running', paused: 'Paused', critical: 'Critical',
     high: 'High', medium: 'Medium', low: 'Low', intent: 'Intent',
-    tasks_note: ' (newest {1} of {2}, by ID)',
+    tasks_note: ' (showing {1} of {2})',
+    tasks_note_custom: ' (custom order · showing {1} of {2})',
+    all_tasks: 'All tasks', all_tasks_title: 'View all tasks and reorder',
+    all_sub: '{1} tasks · drag rows to reorder; the top 5 appear in Recent tasks',
+    all_sub_short: '{1} tasks',
+    cut_label: 'Top 5 shown in Recent tasks', show_badge: 'SHOWN',
+    drag_hint: 'Drag rows to reorder', order_dirty: 'Order changed — click Save to keep it',
+    order_saved: '✓ Display order saved', order_fail: 'Failed to save order', close: 'Close',
     th_task: 'Task', th_status: 'Status', ask: 'Ask',
     no_tasks: 'No tasks on this machine yet',
     st_running: 'running', st_paused: 'paused', st_queued: 'queued', st_created: 'created',
@@ -1363,7 +1718,19 @@ const I18N = {
     dispatched: '✓ Dispatched task #{1} ({2})', dispatch_failed: 'Dispatch failed',
     request_failed_short: '✗ Request failed',
     paused_ok: '✓ Task #{1} paused', resumed_ok: '✓ Task #{1} resumed', queued: ' (queued)',
-    op_failed: 'Operation failed', active_mark: ' (active)'
+    op_failed: 'Operation failed', active_mark: ' (active)',
+    overview: 'All servers', refresh_all: 'Refresh all', refreshing_all: 'Refreshing…',
+    machines_online: 'Online machines', findings_total: 'Critical + high', no_machines: 'No servers yet — add one first',
+    no_saved_credentials: 'No saved credentials', click_machine: 'Click to open', never_refreshed: 'Not refreshed yet',
+    empty_title: 'Use the toggle at top right to connect', empty_hint: 'Tasks and findings load automatically after connection',
+    connecting_body: 'Opening SSH tunnel and signing in to ARTEX…', filter_note: 'Filter: {1} · {2} tasks',
+    reconnecting: 'Reconnect pending', reconnect_in: 'Reconnect attempt {1} · {2}s', reconnect_done: '✓ {1} reconnected',
+    poll_failed: 'Refresh failed: ', new_findings: '{1}: {2} new critical/high findings',
+    copy_reply: 'Copy reply', copied: '✓ Copied', ask_history: 'Previous questions', no_history: 'No previous questions',
+    question: 'Question', answer: 'Reply', export_report_step: 'Exporting main report…',
+    export_critical_step: 'Exporting critical findings…', export_high_step: 'Exporting high findings…',
+    export_finishing: 'Finishing export…', export_failed: 'Export failed', export_partial: '{1} report(s) failed',
+    export_running: 'This task already has an export in progress', task_unread: 'New findings', error_details: 'Error details'
   }
 };
 function T(k, ...args){
@@ -1391,28 +1758,58 @@ async function api(path, body){
   return await r.json();
 }
 function num(v, cls){ return '<td class="num ' + (cls||'') + '">' + (v||0) + '</td>'; }
+function animateView(el){
+  if (!el) return;
+  el.classList.remove('view-enter');
+  void el.offsetWidth;
+  el.classList.add('view-enter');
+}
+function openModal(el){
+  clearTimeout(el._closeTimer);
+  el.classList.remove('closing');
+  el.hidden = false;
+  animateView(el.querySelector('.modal-box'));
+}
+function closeModal(el, after){
+  if (!el || el.hidden) return;
+  el.classList.add('closing');
+  clearTimeout(el._closeTimer);
+  el._closeTimer = setTimeout(() => {
+    el.hidden = true; el.classList.remove('closing');
+    if (after) after();
+  }, 140);
+}
+function setMobileSide(on){
+  document.body.classList.toggle('mobile-side', on);
+  $('side-scrim').hidden = !on;
+}
 
 async function boot(){
   await loadMachines();
-  // 页面刷新后，把服务端还活着的连接同步回来
   try {
     const c = await api('/api/connected', {});
-    (c.ips || []).forEach(ip => { CONNECTED[ip] = true; setDot(ip, 'd1'); });
+    (c.ips || []).forEach(ip => { CONNECTED[ip] = true; WANTED[ip] = true; setDot(ip, 'd1'); });
     if (Object.keys(CONNECTED).length){ startPoll(); pollOnce(); }
   } catch(e){}
+  if (CFG.auto_connect){
+    MACHINES.filter(m => (m.has_password || m.has_key) && !CONNECTED[m.ip])
+      .forEach(m => doConnect(m.ip, true));
+  }
 }
 
 function renderMachines(){
   $('list').innerHTML = MACHINES.map(m =>
     '<div class="item" data-ip="' + esc(m.ip) + '">' +
-      '<span class="dot d0" id="dot-' + esc(m.ip) + '"></span>' +
+      '<span class="dot ' + (CONNECTED[m.ip] ? 'd1' : (RECONNECT[m.ip] ? 'd2' : 'd0')) + '" id="dot-' + esc(m.ip) + '"></span>' +
       '<span><div class="ip">' + esc(m.ip) + '</div><div class="lb">' + esc(m.label || '') +
         ((m.has_password || m.has_key) ? '' : esc(T('no_creds'))) + '</div></span>' +
+      (UNREAD[m.ip] ? '<span class="unread">' + UNREAD[m.ip] + '</span>' : '') +
       '<span class="ops">' +
         '<button class="icon btn-medit" data-ip="' + esc(m.ip) + '" title="' + esc(T('edit')) + '">✎</button>' +
         '<button class="icon btn-mdel" data-ip="' + esc(m.ip) + '" title="' + esc(T('del')) + '">✕</button>' +
       '</span></div>').join('');
   $('list').querySelectorAll('.item').forEach(el => {
+    el.classList.toggle('on', !OVERVIEW && el.dataset.ip === CUR);
     el.onclick = (ev) => {
       if (!ev.target.classList || !ev.target.classList.contains('icon')) select(el.dataset.ip);
     };
@@ -1421,6 +1818,7 @@ function renderMachines(){
     b.onclick = (e) => { e.stopPropagation(); openMachineForm(b.dataset.ip); });
   $('list').querySelectorAll('.btn-mdel').forEach(b =>
     b.onclick = (e) => { e.stopPropagation(); delMachine(b.dataset.ip); });
+  $('btn-overview').classList.toggle('active', OVERVIEW);
 }
 
 async function loadMachines(){
@@ -1428,10 +1826,68 @@ async function loadMachines(){
   MACHINES = d.machines; CFG = d;
   LANG = d.lang === 'en' ? 'en' : 'zh';
   applyLang();
+  let hasTheme = false;
+  try { hasTheme = localStorage.getItem(THEME_KEY) !== null; } catch(e){}
+  if (!hasTheme) applyTheme(d.theme === 'dark');
   $('f-goal-fixed').textContent = d.goal || '';
   $('f-goal-fixed').dataset.raw = d.goal || '';
   $('f-timeout').value = d.timeout_minutes || 600;
   renderMachines();
+  if (OVERVIEW) renderOverview();
+  startPoll();
+}
+
+function openOverview(){
+  closeTasks();
+  OVERVIEW = true; CUR = null; FILTER = null;
+  $('overview').hidden = false; $('panel').hidden = true; $('empty').hidden = true;
+  setMobileSide(false);
+  renderMachines(); renderOverview(); animateView($('overview'));
+}
+
+function overviewChip(k, v, color){
+  return '<div class="chip" style="--c:' + color + '"><div class="k">' + esc(k) + '</div><div class="v">' + (v || 0) + '</div></div>';
+}
+
+function renderOverview(){
+  const rows = MACHINES.map(m => ({m, d: REFRESHED[m.ip]}));
+  const online = rows.filter(x => x.d && x.d.ok).length;
+  const critical = rows.reduce((n, x) => n + ((x.d && x.d.findings) ? x.d.findings.critical + x.d.findings.high : 0), 0);
+  const running = rows.reduce((n, x) => n + ((x.d && x.d.counts) ? (x.d.counts.running || 0) : 0), 0);
+  $('o-chips').innerHTML = overviewChip(T('machines_online'), online + '/' + MACHINES.length, '#4b7357') +
+    overviewChip(T('running'), running, '#96683f') + overviewChip(T('findings_total'), critical, '#a8452f');
+  $('o-cards').innerHTML = rows.length ? rows.map(({m, d}) => {
+    const f = d && d.findings || {}, c = d && d.counts || {};
+    return '<button class="machine-card" data-ip="' + esc(m.ip) + '">' +
+      '<div class="mc-head"><span class="dot ' + (CONNECTED[m.ip] ? 'd1' : (d && d.ok ? 'd1' : 'd2')) + '"></span>' +
+      '<span class="mc-ip">' + esc(m.ip) + '</span>' + (UNREAD[m.ip] ? '<span class="unread">' + UNREAD[m.ip] + '</span>' : '') + '</div>' +
+      '<div class="mc-label">' + esc(m.label || T('click_machine')) + '</div>' +
+      '<div class="mc-stats"><div class="mc-stat"><b>' + (d && d.ok ? d.tasks_total : '—') + '</b><span>' + esc(T('tasks_total')) + '</span></div>' +
+      '<div class="mc-stat"><b>' + (d && d.ok ? (c.running || 0) : '—') + '</b><span>' + esc(T('running')) + '</span></div>' +
+      '<div class="mc-stat"><b class="c-critical">' + (d && d.ok ? (f.critical || 0) : '—') + '</b><span>' + esc(T('critical')) + '</span></div>' +
+      '<div class="mc-stat"><b class="c-high">' + (d && d.ok ? (f.high || 0) : '—') + '</b><span>' + esc(T('high')) + '</span></div></div>' +
+      (d && d.error ? '<div class="mc-error">' + esc(d.error) + '</div>' : '') +
+      '<div class="mc-foot">' + esc(d && d.fetched_at ? T('refreshed_at') + new Date(d.fetched_at * 1000).toLocaleTimeString() : T('never_refreshed')) + '</div></button>';
+  }).join('') : '<div class="empty-table">' + esc(T('no_machines')) + '</div>';
+  $('o-cards').querySelectorAll('.machine-card').forEach(el => el.onclick = () => select(el.dataset.ip));
+}
+
+async function refreshOverview(){
+  const btn = $('btn-refresh-all');
+  btn.disabled = true; btn.textContent = T('refreshing_all');
+  try {
+    const d = await api('/api/overview', {});
+    (d.results || []).forEach(r => {
+      if (r.ok){
+        storeRefreshed(r);
+        if (CUR === r.ip && CONNECTED[r.ip]) render(REFRESHED[r.ip]);
+      } else if (WANTED[r.ip]) handleConnectionLoss(r.ip, r.error || T('poll_failed'));
+      else REFRESHED[r.ip] = Object.assign({}, REFRESHED[r.ip] || {}, r);
+    });
+    $('o-time').textContent = T('refreshed_at') + new Date().toLocaleTimeString();
+    renderOverview();
+  } catch(e){ toast(T('req_failed') + e); }
+  finally { btn.disabled = false; btn.textContent = T('refresh_all'); }
 }
 
 /* ---------- 机器增删改 ---------- */
@@ -1462,7 +1918,7 @@ function openMachineForm(ip){
   $('m-artex-pwd').placeholder = (m && m.has_artex_password) ? T('already_set') : '';
   $('m-msg').textContent = '';
   toggleAuth();
-  $('m-modal').hidden = false;
+  openModal($('m-modal'));
 }
 
 async function saveMachine(){
@@ -1489,7 +1945,7 @@ async function saveMachine(){
   try {
     const d = await api('/api/machines/save', body);
     if (d.ok){
-      $('m-modal').hidden = true;
+      closeModal($('m-modal'));
       setEditing(false);
       await loadMachines();
       $('all-note').textContent = T('saved') + ' ' + ip;
@@ -1505,7 +1961,8 @@ async function delMachine(ip){
   try {
     const d = await api('/api/machines/delete', {ip});
     if (d.ok){
-      delete CONNECTED[ip];
+      delete CONNECTED[ip]; delete WANTED[ip]; delete REFRESHED[ip]; delete UNREAD[ip];
+      clearReconnect(ip);
       await loadMachines();
       if (CUR === ip){ CUR = null; $('panel').hidden = true; $('empty').hidden = false; }
       $('all-note').textContent = T('deleted') + ' ' + ip;
@@ -1542,16 +1999,29 @@ $('btn-settings').onclick = () => { location.href = '/settings'; };
 
 $('m-auth').addEventListener('change', toggleAuth);
 $('m-save').onclick = saveMachine;
-$('m-cancel').onclick = () => { $('m-modal').hidden = true; };
+$('m-cancel').onclick = () => closeModal($('m-modal'));
+$('m-modal').addEventListener('mousedown', e => { if (e.target === $('m-modal')) closeModal($('m-modal')); });
+$('btn-overview').onclick = openOverview;
+$('btn-refresh-all').onclick = refreshOverview;
+$('btn-mobile-side').onclick = () => setMobileSide(!document.body.classList.contains('mobile-side'));
+$('side-scrim').onclick = () => setMobileSide(false);
 
 function select(ip){
-  CUR = ip;
-  document.querySelectorAll('.item').forEach(el => el.classList.toggle('on', el.dataset.ip === ip));
+  closeTasks();
+  if (!OVERVIEW && CUR === ip){
+    CUR = null; FILTER = null; SEL = null; ASK = null;
+    $('panel').hidden = true; $('overview').hidden = true; $('empty').hidden = false;
+    renderMachines(); animateView($('empty')); setMobileSide(false);
+    return;
+  }
+  OVERVIEW = false; CUR = ip; FILTER = null; SEL = null;
+  delete UNREAD[ip];
   const m = MACHINES.find(x => x.ip === ip);
-  $('empty').hidden = true; $('panel').hidden = false;
+  if (!m) return;
+  $('empty').hidden = true; $('overview').hidden = true; $('panel').hidden = false;
   $('p-ip').textContent = ip;
   $('p-label').textContent = m.label || '';
-  $('p-pw').hidden = !!m.has_password;
+  $('p-pw').hidden = !!(m.has_password || m.has_key);
   $('p-pw').value = PWD[ip] || '';
   $('p-err').hidden = true;
   $('f-msg').textContent = '';
@@ -1567,6 +2037,8 @@ function select(ip){
   ASK = null;
   updateDesc();
   const conn = !!CONNECTED[ip];
+  $('p-state-title').textContent = RECONNECT[ip] ? T('reconnecting') : T('empty_title');
+  $('p-state-sub').textContent = RECONNECT[ip] ? (RECONNECT[ip].error || '') : T('empty_hint');
   $('p-placeholder').hidden = conn;
   if (conn){
     const cached = REFRESHED[ip];
@@ -1576,6 +2048,7 @@ function select(ip){
   } else {
     $('p-body').hidden = true;
   }
+  renderMachines(); animateView($('panel')); setMobileSide(false);
 }
 function updateDesc(){
   const v = $('f-name').value.trim();
@@ -1626,116 +2099,252 @@ $('lnk-goal').onclick = (e) => {
 
 function setDot(ip, cls){ const d = $('dot-' + ip); if (d) d.className = 'dot ' + cls; }
 
-let CONNECTED = {};
-let pollTimer = null;
+let CONNECTED = {}, CONNECTING = {};
+let pollTimer = null, pollBusy = false, reconnectTicker = null;
 
 function setConnUI(on){
+  if (!CUR) return;
   $('p-conn').checked = !!on;
   if (on){ $('conn-label').textContent = T('connected'); $('conn-label').style.color = 'var(--ok)'; }
+  else if (RECONNECT[CUR]){ updateReconnectUI(); }
   else { $('conn-label').textContent = T('disconnected'); $('conn-label').style.color = 'var(--ink-3)'; }
-  $('dispatch-sec').hidden = !on;      // 没连接不显示下发区（拿不到 LLM 配置）
-  if ($('p-placeholder')) $('p-placeholder').hidden = !!on;
+  $('dispatch-sec').hidden = !on;
+  $('p-placeholder').hidden = !!on;
+  if (!on) $('connect-skeleton').hidden = true;
 }
 
-async function doConnect(){
-  if (!CUR) return;
-  const ip = CUR, m = MACHINES.find(x => x.ip === ip);
-  const pw = m.has_password ? '' : $('p-pw').value;
-  if (!m.has_password && !pw){ showErr(T('no_pw_top')); setConnUI(false); return; }
+function updateReconnectUI(){
+  const r = CUR && RECONNECT[CUR];
+  if (!r) return;
+  const secs = Math.max(0, Math.ceil((r.next - Date.now()) / 1000));
+  $('conn-label').textContent = T('reconnect_in', r.attempt, secs);
+  $('conn-label').style.color = 'var(--high)';
+  $('p-state-title').textContent = T('reconnecting');
+  $('p-state-sub').textContent = r.error || T('empty_hint');
+}
+
+function ensureReconnectTicker(){
+  if (reconnectTicker) return;
+  reconnectTicker = setInterval(() => {
+    if (!Object.keys(RECONNECT).length){ clearInterval(reconnectTicker); reconnectTicker = null; return; }
+    updateReconnectUI();
+  }, 1000);
+}
+
+function clearReconnect(ip){
+  const r = RECONNECT[ip];
+  if (r && r.timer) clearTimeout(r.timer);
+  delete RECONNECT[ip];
+}
+
+function scheduleReconnect(ip, error){
+  if (!CFG.auto_reconnect || !WANTED[ip]) return;
+  const old = RECONNECT[ip] || {attempt: 0};
+  if (old.timer) return;
+  const attempt = (old.attempt || 0) + 1;
+  const delay = Math.min((CFG.reconnect_seconds || 15) * Math.pow(2, attempt - 1), 120);
+  const r = {attempt, next: Date.now() + delay * 1000, error: error || '', timer: null};
+  r.timer = setTimeout(() => { if (RECONNECT[ip]) RECONNECT[ip].timer = null; doConnect(ip, true); }, delay * 1000);
+  RECONNECT[ip] = r;
+  ensureReconnectTicker(); updateReconnectUI();
+}
+
+async function doConnect(ip, automatic){
+  ip = ip || CUR;
+  const m = MACHINES.find(x => x.ip === ip);
+  if (!m || CONNECTING[ip]) return;
+  WANTED[ip] = true;
+  const previousAttempt = RECONNECT[ip] ? RECONNECT[ip].attempt : 0;
+  if (!automatic) clearReconnect(ip);
+  else if (RECONNECT[ip] && RECONNECT[ip].timer){ clearTimeout(RECONNECT[ip].timer); RECONNECT[ip].timer = null; }
+  const hasSaved = m.has_password || m.has_key;
+  const pw = hasSaved ? '' : (CUR === ip ? $('p-pw').value : (PWD[ip] || ''));
+  if (!hasSaved && !pw){ delete WANTED[ip]; clearReconnect(ip); if (CUR === ip){ showErr(T('no_pw_top')); setConnUI(false); } return; }
   if (pw) PWD[ip] = pw;
-  $('p-err').hidden = true;
-  $('conn-label').textContent = T('connecting');
+  CONNECTING[ip] = true;
+  if (CUR === ip){
+    $('p-err').hidden = true; $('conn-label').textContent = T('connecting');
+    $('p-placeholder').hidden = false; $('p-body').hidden = true;
+    $('p-state-title').textContent = T('connecting'); $('p-state-sub').textContent = T('connecting_body');
+    $('connect-skeleton').hidden = false;
+  }
   try {
     const d = await api('/api/connect', {ip, password: pw});
-    if (!d.ok){
-      showErr(d.error || T('conn_failed'));
-      setDot(ip, 'd2'); setConnUI(false); return;
-    }
-    CONNECTED[ip] = true;
-    setDot(ip, 'd1');
-    REFRESHED[ip] = d;
-    render(d);
-    setConnUI(true);
+    if (!WANTED[ip]){ api('/api/disconnect', {ip}).catch(() => {}); return; }
+    if (!d.ok) throw new Error(d.error || T('conn_failed'));
+    CONNECTED[ip] = true; WANTED[ip] = true;
+    clearReconnect(ip); setDot(ip, 'd1'); storeRefreshed(d);
+    if (CUR === ip){ render(REFRESHED[ip]); setConnUI(true); $('p-err').hidden = true; }
     startPoll();
+    if (previousAttempt) toast(T('reconnect_done', ip));
   } catch(e){
-    showErr(T('conn_failed_e') + e);
-    setConnUI(false);
+    delete CONNECTED[ip]; setDot(ip, 'd2');
+    if (CUR === ip){ setConnUI(false); $('p-body').hidden = true; showErr(T('conn_failed_e') + e.message); }
+    scheduleReconnect(ip, e.message);
+    if (CUR === ip && !RECONNECT[ip]){
+      $('p-state-title').textContent = T('empty_title'); $('p-state-sub').textContent = T('empty_hint');
+    }
+  } finally {
+    delete CONNECTING[ip];
+    if (CUR === ip) $('connect-skeleton').hidden = true;
   }
 }
 
 async function doDisconnect(){
   if (!CUR) return;
   const ip = CUR;
-  setConnUI(false);
-  delete CONNECTED[ip];
-  $('p-body').hidden = true;
+  delete WANTED[ip]; clearReconnect(ip); delete CONNECTED[ip];
+  setConnUI(false); $('p-body').hidden = true;
+  $('p-state-title').textContent = T('empty_title'); $('p-state-sub').textContent = T('empty_hint');
   try { await api('/api/disconnect', {ip}); } catch(e){}
   if (!Object.keys(CONNECTED).length) stopPoll();
 }
 
 function startPoll(){
-  if (pollTimer) return;
-  pollTimer = setInterval(pollOnce, 8000);
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = null;
+  if (!Object.keys(CONNECTED).length) return;
+  const seconds = document.hidden ? (CFG.background_refresh_seconds || 30) : (CFG.refresh_seconds || 8);
+  pollTimer = setInterval(pollOnce, Math.max(3, seconds) * 1000);
 }
 function stopPoll(){
   if (pollTimer){ clearInterval(pollTimer); pollTimer = null; }
 }
 
-async function pollOnce(){
-  // 只刷当前会话（其它连着的机器保持连接、切过去时再刷）
-  const ips = (CUR && CONNECTED[CUR]) ? [CUR] : [];
-  if (!Object.keys(CONNECTED).length){ stopPoll(); return; }
-  if (!ips.length) return;
-  let d;
-  try { d = await api('/api/poll', {ips}); } catch(e){ return; }
-  (d.results || []).forEach(r => {
-    if (r.ok){
-      REFRESHED[r.ip] = Object.assign({}, REFRESHED[r.ip] || {}, r);
-      setDot(r.ip, 'd1');
-      if (r.ip === CUR && CONNECTED[r.ip]) render(r);
-    } else {
-      delete CONNECTED[r.ip];
-      setDot(r.ip, 'd2');
-      if (r.ip === CUR){ setConnUI(false); showErr(T('disconnected_e') + (r.error || '')); }
+document.addEventListener('visibilitychange', () => { startPoll(); if (!document.hidden) pollOnce(); });
+
+function storeRefreshed(r){
+  const old = REFRESHED[r.ip];
+  if (old && old.ok) noteFindings(old, r);
+  REFRESHED[r.ip] = Object.assign({}, old || {}, r);
+}
+
+function noteFindings(old, next){
+  const before = new Map((old.all_tasks || []).map(t => [String(t.id), (t.findings.critical || 0) + (t.findings.high || 0)]));
+  let delta = 0;
+  (next.all_tasks || []).forEach(t => {
+    const id = String(t.id), value = (t.findings.critical || 0) + (t.findings.high || 0);
+    const diff = Math.max(0, value - (before.has(id) ? before.get(id) : value));
+    if (diff){
+      delta += diff;
+      if (!TASK_UNREAD[next.ip]) TASK_UNREAD[next.ip] = {};
+      TASK_UNREAD[next.ip][id] = (TASK_UNREAD[next.ip][id] || 0) + diff;
     }
   });
-  if (!Object.keys(CONNECTED).length) stopPoll();
+  if (!delta) return;
+  UNREAD[next.ip] = (UNREAD[next.ip] || 0) + delta;
+  renderMachines(); if (OVERVIEW) renderOverview();
+  toast(T('new_findings', next.ip, delta));
+  if (CFG.desktop_notifications && document.hidden && 'Notification' in window && Notification.permission === 'granted')
+    new Notification('ARTEX Controller', {body: T('new_findings', next.ip, delta), icon: '/icon.ico'});
+}
+
+function handleConnectionLoss(ip, error){
+  delete CONNECTED[ip]; setDot(ip, 'd2');
+  if (CUR === ip){
+    setConnUI(false); $('p-body').hidden = true; $('p-placeholder').hidden = false;
+    showErr(T('disconnected_e') + (error || ''));
+  }
+  scheduleReconnect(ip, error);
+}
+
+async function pollOnce(){
+  const ips = Object.keys(CONNECTED);
+  if (!ips.length || pollBusy){ if (!ips.length) stopPoll(); return; }
+  pollBusy = true;
+  try {
+    const d = await api('/api/poll', {ips});
+    (d.results || []).forEach(r => {
+      if (r.ok){
+        clearReconnect(r.ip); storeRefreshed(r); setDot(r.ip, 'd1');
+        if (r.ip === CUR && CONNECTED[r.ip]) render(REFRESHED[r.ip]);
+      } else handleConnectionLoss(r.ip, r.error || T('poll_failed'));
+    });
+    if (OVERVIEW) renderOverview();
+  } catch(e){
+    ips.forEach(ip => handleConnectionLoss(ip, T('poll_failed') + e));
+  } finally {
+    pollBusy = false;
+    if (!Object.keys(CONNECTED).length) stopPoll();
+  }
 }
 
 $('p-conn').addEventListener('change', () => {
   if ($('p-conn').checked) doConnect(); else doDisconnect();
 });
 
-function showErr(msg){ const e = $('p-err'); e.textContent = msg; e.hidden = false; }
+function showErr(msg){
+  const text = String(msg || '');
+  $('p-err-text').textContent = text.length > 110 ? text.slice(0, 110) + '…' : text;
+  $('p-err-detail').textContent = text; $('p-err').hidden = false;
+}
+
+function numId(id){ const n = parseInt(id, 10); return isNaN(n) ? -1 : n; }
+function orderedTasks(d){
+  const all = d.all_tasks || [];
+  const order = (d.task_order || []).map(String);
+  const pos = new Map(order.map((id, i) => [id, i]));
+  const known = all.filter(t => pos.has(String(t.id)))
+                   .sort((a, b) => pos.get(String(a.id)) - pos.get(String(b.id)));
+  const fresh = all.filter(t => !pos.has(String(t.id)))
+                   .sort((a, b) => numId(b.id) - numId(a.id));
+  return fresh.concat(known);
+}
+
+function taskMatches(t, filter){
+  if (!filter || filter === 'all') return true;
+  if (filter === 'running' || filter === 'paused') return t.status === filter;
+  if (filter === 'intent') return (t.in_flight || 0) > 0;
+  return ((t.findings || {})[filter] || 0) > 0;
+}
 
 function render(d){
-  $('p-body').hidden = false;
+  $('p-body').hidden = false; $('p-placeholder').hidden = true;
   $('p-time').textContent = d.fetched_at ? (T('refreshed_at') + new Date(d.fetched_at*1000).toLocaleTimeString()) : '';
   const f = d.findings, c = d.counts || {};
+  const oldValues = [...$('chips').querySelectorAll('.v')].map(x => x.textContent);
   $('chips').innerHTML =
-    chip(T('tasks_total'), d.tasks_total, '#96683f') +
-    chip(T('running'), c.running || 0, '#4b7357') +
-    chip(T('paused'), c.paused || 0, '#9c8636') +
-    chip(T('critical'), f.critical, '#a8452f') +
-    chip(T('high'), f.high, '#bf7132') +
-    chip(T('medium'), f.medium, '#9c8636') +
-    chip(T('low'), f.low, '#5d7f93') +
-    chip(T('intent'), d.in_flight, '#786c5d');
-  $('t-note').textContent = d.active.length
-      ? T('tasks_note', d.active.length, d.active_total) : '';
-  $('tasks').innerHTML = d.active.length ? ('<table><tr><th>#</th><th>' + T('th_task') + '</th><th>' + T('th_status') + '</th>' +
-      '<th class="num">' + T('intent') + '</th><th class="num">' + T('critical') + '</th><th class="num">' + T('high') + '</th><th class="num">' + T('medium') + '</th><th class="num">' + T('low') + '</th><th class="ops"></th></tr>' +
-      d.active.map(t => '<tr data-id="' + esc(t.id) + '" data-name="' + esc(t.name) + '"><td class="muted">' + esc(t.id) + '</td><td>' + esc(t.name) + '</td>' +
-        '<td><span class="tag s-' + esc(t.status) + '">' + esc(stName(t.status)) + '</span></td>' +
+    chip('all', T('tasks_total'), d.tasks_total, '#96683f') +
+    chip('running', T('running'), c.running || 0, '#4b7357') +
+    chip('paused', T('paused'), c.paused || 0, '#9c8636') +
+    chip('critical', T('critical'), f.critical, '#a8452f') +
+    chip('high', T('high'), f.high, '#bf7132') +
+    chip('medium', T('medium'), f.medium, '#9c8636') +
+    chip('low', T('low'), f.low, '#5d7f93') +
+    chip('intent', T('intent'), d.in_flight, '#786c5d');
+  [...$('chips').children].forEach((el, i) => {
+    if (oldValues[i] != null && oldValues[i] !== el.querySelector('.v').textContent) el.classList.add('bump');
+    el.onclick = () => {
+      FILTER = FILTER === el.dataset.filter ? null : el.dataset.filter;
+      SEL = null; $('exp-msg').textContent = ''; $('exp-progress').hidden = true;
+      render(REFRESHED[CUR]);
+    };
+  });
+  const list = orderedTasks(d), filtered = list.filter(t => taskMatches(t, FILTER));
+  const shown = FILTER && FILTER !== 'all' ? filtered : filtered.slice(0, 5);
+  const total = d.tasks_total != null ? d.tasks_total : list.length;
+  const custom = (d.task_order || []).length > 0;
+  $('t-note').textContent = FILTER && FILTER !== 'all'
+    ? T('filter_note', T(FILTER), filtered.length)
+    : (shown.length ? T(custom ? 'tasks_note_custom' : 'tasks_note', shown.length, total) : '');
+  $('btn-all').disabled = !list.length;
+  $('all-count').textContent = total;
+  $('tasks').innerHTML = shown.length ? ('<table><thead><tr><th>#</th><th>' + T('th_task') + '</th><th>' + T('th_status') + '</th>' +
+      '<th class="num">' + T('intent') + '</th><th class="num">' + T('critical') + '</th><th class="num">' + T('high') + '</th><th class="num">' + T('medium') + '</th><th class="num">' + T('low') + '</th><th class="ops"></th></tr></thead><tbody>' +
+      shown.map(t => {
+        const unread = TASK_UNREAD[d.ip] && TASK_UNREAD[d.ip][String(t.id)];
+        return '<tr data-id="' + esc(t.id) + '" data-name="' + esc(t.name) + '"' + (SEL && SEL.id === String(t.id) ? ' class="sel"' : '') + '>' +
+        '<td class="muted">' + esc(t.id) + '</td><td>' + esc(t.name) + (unread ? '<span class="task-unread" title="' + esc(T('task_unread')) + '"></span>' : '') + '</td>' +
+        '<td><span class="tag s-' + esc(t.status) + '"><i></i>' + esc(stName(t.status)) + '</span></td>' +
         '<td class="num">' + t.in_flight + '</td>' + num(t.findings.critical, t.findings.critical?'c-critical':'') +
         num(t.findings.high, t.findings.high?'c-high':'') + num(t.findings.medium, t.findings.medium?'c-medium':'') +
         num(t.findings.low, t.findings.low?'c-low':'') + '<td class="ops">' + ctrlBtn(t) +
-        '<button class="mini ghost btn-ask" data-id="' + esc(t.id) + '" data-name="' + esc(t.name) + '">' + T('ask') + '</button></td></tr>').join('') + '</table>')
-    : '<div class="muted">' + T('no_tasks') + '</div>';
-  SEL = null;
-  $('btn-export').disabled = true;
-  $('exp-msg').textContent = '';
-  // 继承任务下拉（保留当前选择）
+        '<button class="mini ghost btn-ask" data-id="' + esc(t.id) + '" data-name="' + esc(t.name) + '">' + T('ask') + '</button></td></tr>';
+      }).join('') + '</tbody></table>')
+    : '<div class="empty-table">' + esc(T('no_tasks')) + '</div>';
+  if (SEL && !list.some(t => String(t.id) === SEL.id)) SEL = null;
+  $('btn-export').disabled = !SEL || !!(SEL && EXPORTING[CUR + ':' + SEL.id]);
+
   const srcSel = $('f-src');
   const keep = srcSel.value;
   srcSel.innerHTML = '<option value="">' + esc(T('no_inherit')) + '</option>' +
@@ -1754,8 +2363,15 @@ function render(d){
       document.querySelectorAll('#tasks tbody tr').forEach(x => x.classList.remove('sel'));
       tr.classList.add('sel');
       SEL = {id: tr.dataset.id, name: tr.dataset.name};
-      $('btn-export').disabled = false;
-      $('exp-msg').textContent = '';
+      if (TASK_UNREAD[CUR]) delete TASK_UNREAD[CUR][String(SEL.id)];
+      tr.querySelector('.task-unread')?.remove();
+      const exportKey = CUR + ':' + SEL.id;
+      $('btn-export').disabled = !!EXPORTING[exportKey];
+      if (!EXPORTING[exportKey]){
+        $('exp-progress').hidden = true;
+        if (EXPORT_RESULTS[exportKey]) showExportResult(EXPORT_RESULTS[exportKey]);
+        else $('exp-msg').textContent = '';
+      }
     };
   });
 
@@ -1771,8 +2387,9 @@ function render(d){
     }
   }
 }
-function chip(k, v, color){
-  return '<div class="chip"><div class="k">' + k + '</div><div class="v" style="color:' + color + '">' + (v||0) + '</div></div>';
+function chip(filter, k, v, color){
+  const active = FILTER === filter || (!FILTER && filter === 'all');
+  return '<button class="chip' + (active ? ' active' : '') + '" data-filter="' + filter + '" aria-pressed="' + active + '" style="--c:' + color + '"><div class="k">' + esc(k) + '</div><div class="v">' + (v||0) + '</div></button>';
 }
 
 function askSend(){
@@ -1898,78 +2515,174 @@ async function doControl(btn){
 }
 
 function openAsk(id, name){
-  ASK = {id: id, name: name};
+  ASK = {ip: CUR, id: String(id), name: name, history: [], latestReply: ''};
   $('ask-sec').hidden = false;
   $('ask-title').textContent = '#' + id + ' ' + name;
-  $('ask-reply').hidden = true;
-  $('ask-reply').textContent = '';
-  $('ask-status').textContent = '';
-  $('ask-msg').value = '';
+  $('ask-reply').hidden = true; $('ask-reply').textContent = '';
+  $('btn-copy-reply').hidden = true;
+  $('ask-status').textContent = ''; $('ask-history').innerHTML = '';
+  $('ask-msg').value = ''; $('btn-ask').disabled = askPending;
+  loadAskHistory();
   $('ask-msg').focus();
-  $('ask-sec').scrollIntoView({block: 'nearest'});
+  $('ask-sec').scrollIntoView({block: 'nearest', behavior: 'smooth'});
 }
 
+async function loadAskHistory(){
+  if (!ASK) return;
+  const target = ASK;
+  try {
+    const d = await api('/api/ask-history', {ip: target.ip, task_id: target.id});
+    if (ASK === target && d.ok) renderAskHistory(d.items || [], true);
+  } catch(e){}
+}
+
+function renderAskHistory(items, showLatest){
+  if (!ASK) return;
+  ASK.history = items;
+  $('ask-history').innerHTML = items.length ? '<div class="muted" style="margin-top:12px">' + esc(T('ask_history')) + '</div>' +
+    items.slice().reverse().map((it, i) => '<details' + (i === 0 && items.length > 1 ? '' : '') + '><summary>' + esc(it.message.slice(0, 100)) + '</summary>' +
+      '<div class="qa"><b>' + esc(T('question')) + '</b>' + esc(it.message) + '<b>' + esc(T('answer')) + '</b>' + esc(it.reply || T('empty_reply')) + '</div></details>').join('')
+    : '<div class="muted" style="margin-top:12px">' + esc(T('no_history')) + '</div>';
+  if (showLatest && items.length){
+    const latest = items[items.length - 1];
+    ASK.latestReply = latest.reply || '';
+    $('ask-reply').textContent = latest.reply || T('empty_reply');
+    $('ask-reply').hidden = false; $('btn-copy-reply').hidden = !ASK.latestReply;
+  }
+}
+
+let askPending = false;
 async function doAsk(){
-  if (!ASK || !CUR) return;
+  if (!ASK || !CUR || askPending) return;
   const msg = $('ask-msg').value.trim();
   if (!msg){ $('ask-status').textContent = T('ask_empty'); return; }
-  const m = MACHINES.find(x => x.ip === CUR);
-  const pw = m.has_password ? '' : $('p-pw').value;
-  $('btn-ask').disabled = true;
-  $('btn-ask').textContent = T('sending');
-  $('ask-reply').hidden = true;
+  const target = ASK, ip = CUR;
+  const m = MACHINES.find(x => x.ip === ip);
+  const pw = (m.has_password || m.has_key) ? '' : $('p-pw').value;
+  askPending = true; $('btn-ask').disabled = true; $('btn-ask').textContent = T('sending');
+  $('ask-reply').hidden = true; $('btn-copy-reply').hidden = true;
   const t0 = Date.now();
   const timer = setInterval(() => {
-    $('ask-status').textContent = T('waiting') + Math.round((Date.now() - t0) / 1000) + 's';
+    if (ASK === target) $('ask-status').textContent = T('waiting') + Math.round((Date.now() - t0) / 1000) + 's';
   }, 1000);
   try {
-    const d = await api('/api/ask', {ip: CUR, password: pw, task_id: ASK.id, message: msg});
+    const d = await api('/api/ask', {ip, password: pw, task_id: target.id, message: msg});
+    if (ASK !== target || CUR !== ip) return;
     $('ask-reply').hidden = false;
     if (d.ok){
       $('ask-status').textContent = '';
+      ASK.latestReply = d.reply || '';
       $('ask-reply').textContent = d.reply || T('empty_reply');
+      $('btn-copy-reply').hidden = !ASK.latestReply;
+      $('ask-msg').value = '';
     } else {
       $('ask-status').textContent = '';
       $('ask-reply').innerHTML = '<span style="color:#a8452f">✗ ' + esc(d.error || T('op_failed')) + '</span>';
     }
+    if (d.history) renderAskHistory(d.history, false);
   } catch(e){
-    $('ask-status').textContent = '';
-    $('ask-reply').hidden = false;
-    $('ask-reply').textContent = T('req_failed') + e;
+    if (ASK === target){
+      $('ask-status').textContent = ''; $('ask-reply').hidden = false;
+      $('ask-reply').textContent = T('req_failed') + e;
+    }
   } finally {
-    clearInterval(timer);
-    $('btn-ask').disabled = false;
-    $('btn-ask').textContent = T('send');
+    clearInterval(timer); askPending = false;
+    $('btn-ask').disabled = false; $('btn-ask').textContent = T('send');
   }
 }
+
+$('btn-copy-reply').onclick = async () => {
+  if (!ASK || !ASK.latestReply) return;
+  try { await navigator.clipboard.writeText(ASK.latestReply); }
+  catch(e){
+    const ta = document.createElement('textarea'); ta.value = ASK.latestReply; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy'); ta.remove();
+  }
+  toast(T('copied'));
+};
 
 $('btn-ask').onclick = doAsk;
 $('ask-msg').addEventListener('keydown', e => {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)){ e.preventDefault(); doAsk(); }
 });
 
+function exportStageText(stage){
+  return T({report: 'export_report_step', critical: 'export_critical_step', high: 'export_high_step',
+            finishing: 'export_finishing'}[stage] || 'export_report_step');
+}
+
+function updateExportProgress(ctx, stage){
+  if (CUR !== ctx.ip || !SEL || SEL.id !== ctx.task_id) return;
+  const widths = {report: 18, critical: 45, high: 73, finishing: 92};
+  $('exp-progress').hidden = false; $('exp-progress').classList.add('indeterminate');
+  $('exp-bar').style.width = (widths[stage] || 12) + '%';
+  $('exp-msg').textContent = exportStageText(stage);
+}
+
+function showExportResult(d){
+  if (!d) return;
+  $('exp-progress').hidden = true;
+  if (!d.ok){ $('exp-msg').innerHTML = '<span style="color:#a8452f">✗ ' + esc(d.error || T('export_failed')) + '</span>'; return; }
+  const errors = (d.errors || []).length;
+  $('exp-msg').innerHTML = '<span class="ok">' + esc(T('exported_to', d.dir, d.critical || 0, d.high || 0)) + '</span> ' +
+    (errors ? '<span style="color:var(--high)">' + esc(T('export_partial', errors)) + '</span> ' : '') +
+    '<a href="#" id="lnk-open" style="color:var(--accent)">' + esc(T('open_dir')) + '</a>';
+  $('lnk-open').onclick = async (e) => {
+    e.preventDefault();
+    const r = await api('/api/open-dir', {dir: d.dir});
+    if (!r.ok) toast(r.error || T('op_failed'));
+  };
+}
+
+async function pollExport(ctx){
+  let failures = 0;
+  while (EXPORTING[ctx.key]){
+    try {
+      const d = await api('/api/export-status', {job_id: ctx.job_id});
+      failures = 0;
+      if (d.status === 'running'){ updateExportProgress(ctx, d.stage); }
+      else {
+        delete EXPORTING[ctx.key]; EXPORT_RESULTS[ctx.key] = d;
+        if (CUR === ctx.ip && SEL && SEL.id === ctx.task_id){
+          showExportResult(d); $('btn-export').disabled = false; $('btn-export').textContent = T('export');
+        } else if (d.ok) toast(T('export') + ' ✓');
+        return;
+      }
+    } catch(e){
+      failures++;
+      if (failures >= 5){
+        const d = {ok: false, error: T('req_failed') + e};
+        delete EXPORTING[ctx.key]; EXPORT_RESULTS[ctx.key] = d;
+        if (CUR === ctx.ip && SEL && SEL.id === ctx.task_id){
+          showExportResult(d); $('btn-export').disabled = false; $('btn-export').textContent = T('export');
+        }
+        return;
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, 700));
+  }
+}
+
 async function doExport(){
   if (!CUR || !SEL) return;
-  const m = MACHINES.find(x => x.ip === CUR);
-  const pw = m.has_password ? '' : $('p-pw').value;
-  $('btn-export').disabled = true;
-  $('btn-export').textContent = T('exporting');
-  $('exp-msg').textContent = '';
+  const ip = CUR, selection = {id: SEL.id, name: SEL.name}, key = ip + ':' + SEL.id;
+  if (EXPORTING[key]){ toast(T('export_running')); return; }
+  const m = MACHINES.find(x => x.ip === ip);
+  const pw = (m.has_password || m.has_key) ? '' : $('p-pw').value;
+  EXPORTING[key] = true; delete EXPORT_RESULTS[key];
+  $('btn-export').disabled = true; $('btn-export').textContent = T('exporting');
+  $('exp-msg').textContent = ''; $('exp-progress').hidden = false; $('exp-bar').style.width = '12%';
   try {
-    const d = await api('/api/export', {ip: CUR, password: pw,
-      task_id: SEL.id, task_name: SEL.name});
-    if (d.ok){
-      $('exp-msg').innerHTML = '<span class="ok">' + esc(T('exported_to', d.dir, d.critical || 0, d.high || 0)) + '</span> ' +
-        '<a href="#" id="lnk-open" style="color:var(--accent)">' + esc(T('open_dir')) + '</a>';
-      $('lnk-open').onclick = (e) => { e.preventDefault(); api('/api/open-dir', {dir: d.dir}); };
-    } else {
-      $('exp-msg').innerHTML = '<span style="color:#a8452f">✗ ' + esc(d.error || T('op_failed')) + '</span>';
-    }
+    const d = await api('/api/export', {ip, password: pw, task_id: selection.id, task_name: selection.name});
+    if (!d.ok) throw new Error(d.error || T('export_failed'));
+    const ctx = {ip, task_id: selection.id, key, job_id: d.job_id};
+    EXPORTING[key] = ctx; updateExportProgress(ctx, 'report'); pollExport(ctx);
   } catch(e){
-    $('exp-msg').innerHTML = '<span style="color:#a8452f">✗ ' + esc(T('req_failed')) + esc(e) + '</span>';
-  } finally {
-    $('btn-export').disabled = !SEL;
-    $('btn-export').textContent = T('export');
+    delete EXPORTING[key];
+    const result = {ok: false, error: e.message}; EXPORT_RESULTS[key] = result;
+    if (CUR === ip && SEL && SEL.id === selection.id){
+      showExportResult(result); $('btn-export').disabled = false; $('btn-export').textContent = T('export');
+    }
   }
 }
 $('btn-export').onclick = doExport;
@@ -1977,7 +2690,168 @@ $('btn-send').onclick = askSend;
 $('btn-confirm-send').onclick = () => { $('f-confirm').hidden = true; $('btn-send').disabled = false; send(); };
 $('btn-cancel-send').onclick = cancelSend;
 $('f-name').addEventListener('keydown', e => { if (e.key === 'Enter'){ e.preventDefault(); askSend(); } });
-document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('f-confirm').hidden) cancelSend(); });
+
+/* ---------- 全部任务：拖动排序 ---------- */
+function taskRowHTML(t, i){
+  const unread = TASK_UNREAD[CUR] && TASK_UNREAD[CUR][String(t.id)];
+  return '<div class="trow' + (i < 5 ? ' on' : '') + '" draggable="true" data-id="' + esc(t.id) + '">' +
+    '<span class="grip"></span>' +
+    '<span class="rank">' + (i + 1) + '</span>' +
+    '<span class="tid">#' + esc(t.id) + '</span>' +
+    '<span class="tname" title="' + esc(t.name) + '">' + esc(t.name) + (unread ? '<span class="task-unread"></span>' : '') + '</span>' +
+    '<span class="tag s-' + esc(t.status) + '"><i></i>' + esc(stName(t.status)) + '</span>' +
+    (i < 5 ? '<span class="tshow">' + esc(T('show_badge')) + '</span>' : '') +
+    '</div>';
+}
+
+function syncCut(){
+  const wrap = $('t-list');
+  let cut = $('t-cut');
+  if (!cut){
+    cut = document.createElement('div');
+    cut.id = 't-cut'; cut.className = 'tcut';
+    wrap.appendChild(cut);
+  }
+  cut.textContent = T('cut_label');
+  const rows = wrap.querySelectorAll('.trow');
+  if (rows.length > 5){ rows[4].after(cut); cut.hidden = false; }
+  else cut.hidden = true;
+}
+
+function syncTaskRows(){
+  const rows = [...$('t-list').querySelectorAll('.trow')];
+  T_ORDER = rows.map(r => r.dataset.id);
+  rows.forEach((r, i) => {
+    r.classList.toggle('on', i < 5);
+    const rank = r.querySelector('.rank');
+    if (rank) rank.textContent = i + 1;
+    const badge = r.querySelector('.tshow');
+    if (i < 5 && !badge){
+      const b = document.createElement('span');
+      b.className = 'tshow'; b.textContent = T('show_badge');
+      r.appendChild(b);
+    } else if (i >= 5 && badge){ badge.remove(); }
+  });
+  syncCut();
+  $('t-msg').textContent = T_ORDER.join(',') === T_ORIG ? '' : T('order_dirty');
+}
+
+function openTasks(){
+  if (!CUR) return;
+  const d = REFRESHED[CUR];
+  if (!d || !d.ok) return;
+  const tasks = orderedTasks(d);
+  if (!tasks.length) return;
+  T_ORDER = tasks.map(t => String(t.id));
+  T_ORIG = T_ORDER.join(',');
+  $('t-sub-ip').textContent = CUR;
+  $('t-sub').textContent = T(tasks.length > 5 ? 'all_sub' : 'all_sub_short', tasks.length);
+  $('t-msg').textContent = '';
+  $('t-save').disabled = false;
+  $('t-list').innerHTML = tasks.map(taskRowHTML).join('');
+  syncCut();
+  $('t-list').scrollTop = 0;
+  openModal($('t-modal'));
+  $('t-save').focus();
+}
+
+function closeTasks(){
+  if ($('t-modal').hidden) return;
+  closeModal($('t-modal'), () => {
+    $('t-list').innerHTML = '';
+    T_ORDER = null; T_ORIG = ''; DRAG_ID = null;
+  });
+}
+
+async function saveTasks(){
+  if (!CUR || !T_ORDER || !T_ORDER.length) return;
+  const ip = CUR, order = T_ORDER.slice();
+  $('t-save').disabled = true;
+  $('t-msg').textContent = T('saving');
+  try {
+    const d = await api('/api/task-order', {ip: ip, order: order});
+    if (d.ok){
+      const cached = REFRESHED[ip];
+      if (cached){ cached.task_order = (d.order || order).slice(); render(cached); }
+      closeTasks();
+      toast(T('order_saved'));
+    } else {
+      $('t-msg').innerHTML = '<span style="color:#a8452f">✗ ' + esc(d.error || T('order_fail')) + '</span>';
+      $('t-save').disabled = false;
+    }
+  } catch(e){
+    $('t-msg').innerHTML = '<span style="color:#a8452f">✗ ' + esc(T('req_failed')) + esc(e) + '</span>';
+    $('t-save').disabled = false;
+  }
+}
+
+function onDragStart(e){
+  const row = e.target.closest('.trow');
+  if (!row) return;
+  DRAG_ID = row.dataset.id;
+  row.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  try { e.dataTransfer.setData('text/plain', DRAG_ID); } catch(err){}
+}
+
+function onDragOver(e){
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  const wrap = $('t-list');
+  const dragging = wrap.querySelector('.trow.dragging');
+  if (!dragging) return;
+  const after = [...wrap.querySelectorAll('.trow:not(.dragging)')].find(r => {
+    const box = r.getBoundingClientRect();
+    return e.clientY < box.top + box.height / 2;
+  });
+  if (after) wrap.insertBefore(dragging, after);
+  else wrap.appendChild(dragging);
+  syncTaskRows();
+}
+
+function onDragEnd(){
+  const wrap = $('t-list');
+  wrap.querySelectorAll('.trow.dragging').forEach(r => r.classList.remove('dragging'));
+  DRAG_ID = null;
+  syncTaskRows();
+}
+
+let toastTimer = null;
+function toast(msg){
+  const el = $('toast');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2000);
+}
+
+$('btn-all').onclick = openTasks;
+$('t-close').onclick = closeTasks;
+$('t-cancel').onclick = closeTasks;
+$('t-save').onclick = saveTasks;
+$('t-modal').addEventListener('mousedown', e => { if (e.target === $('t-modal')) closeTasks(); });
+$('t-list').addEventListener('dragstart', onDragStart);
+$('t-list').addEventListener('dragover', onDragOver);
+$('t-list').addEventListener('drop', e => e.preventDefault());
+$('t-list').addEventListener('dragend', onDragEnd);
+
+document.addEventListener('pointerdown', e => {
+  const b = e.target.closest('button');
+  if (!b || b.disabled || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const box = b.getBoundingClientRect(), size = Math.max(box.width, box.height);
+  const r = document.createElement('span'); r.className = 'ripple';
+  r.style.cssText = 'width:' + size + 'px;height:' + size + 'px;left:' + (e.clientX - box.left - size / 2) + 'px;top:' + (e.clientY - box.top - size / 2) + 'px';
+  b.appendChild(r); setTimeout(() => r.remove(), 480);
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (!$('t-modal').hidden){ closeTasks(); return; }
+  if (!$('m-modal').hidden){ closeModal($('m-modal')); return; }
+  if (document.body.classList.contains('mobile-side')){ setMobileSide(false); return; }
+  if (!$('f-confirm').hidden) cancelSend();
+});
 
 boot();
 </script>
@@ -1993,113 +2867,136 @@ SETTINGS_HTML = r"""<!DOCTYPE html>
 <title>ARTEX · Settings</title>
 <link rel="icon" href="/icon.ico">
 <style>
-  :root{
-    --bg:#f6f1e7;--panel:#fdfaf4;--line:#e6dccb;--line-soft:#efe7d9;
-    --ink:#4a4136;--ink-2:#786c5d;--ink-3:#a59a8b;
-    --accent:#96683f;--accent-d:#7d5533;--ok:#4b7357;--crit:#a8452f;
-  }
-  *{box-sizing:border-box}
-  body.dark{
-    --bg:#1f1a15;--panel:#272119;--line:#3b332a;--line-soft:#332c24;
-    --ink:#e6dccc;--ink-2:#bdb09e;--ink-3:#8a7d6c;
-    --accent:#d0a271;--accent-d:#b98a55;--ok:#83b18e;--crit:#d97f68;
-  }
+  :root{--bg:#f6f1e7;--panel:#fdfaf4;--panel2:#f1e9db;--line:#e6dccb;--soft:#efe7d9;
+    --ink:#4a4136;--ink2:#786c5d;--ink3:#a59a8b;--accent:#96683f;--accentd:#7d5533;
+    --ok:#4b7357;--crit:#a8452f}
+  *{box-sizing:border-box}[hidden]{display:none!important}
+  body.dark{--bg:#1f1a15;--panel:#272119;--panel2:#2f2820;--line:#3b332a;--soft:#332c24;
+    --ink:#e6dccc;--ink2:#bdb09e;--ink3:#8a7d6c;--accent:#d0a271;--accentd:#b98a55;
+    --ok:#83b18e;--crit:#d97f68}
   html,body{margin:0;min-height:100%}
-  body{
-    background:var(--bg);color:var(--ink);
-    font:13.5px/1.65 "Segoe UI","Microsoft YaHei","PingFang SC",system-ui,sans-serif;
-    display:flex;justify-content:center;padding:48px 20px;
-    -webkit-font-smoothing:antialiased;
-  }
-  .wrap{width:min(620px,100%)}
-  .head{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:18px}
-  .brand{font-size:16px;font-weight:600;letter-spacing:.4px;color:var(--accent)}
-  .sub{font-size:12px;color:var(--ink-3);letter-spacing:1px;margin-top:2px}
-  .back{color:var(--accent);font-size:12px;text-decoration:none}
+  body{background:var(--bg);color:var(--ink);font:13.5px/1.65 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+    padding:38px 20px 90px;-webkit-font-smoothing:antialiased;transition:background .2s,color .2s}
+  .wrap{width:min(850px,100%);margin:auto}
+  .head{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:20px;gap:16px}
+  .brand{font-size:17px;font-weight:600;letter-spacing:.4px;color:var(--accent)}
+  .sub{font-size:12px;color:var(--ink3);letter-spacing:1px;margin-top:2px}
+  .back{color:var(--accent);font-size:12px;text-decoration:none;white-space:nowrap}
   .back:hover{text-decoration:underline}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
-        padding:20px 22px;box-shadow:0 1px 3px rgba(120,95,60,.06)}
-  .row{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px}
-  .field{display:flex;flex-direction:column;gap:5px}
-  .field label{font-size:11px;letter-spacing:.4px;color:var(--ink-3)}
-  input,select{
-    font:inherit;font-size:13px;color:var(--ink);background:#fffdf9;
-    border:1px solid var(--line);border-radius:6px;padding:6px 10px;
-  }
-  body.dark input,body.dark select{background:#231e18}
-  input:focus,select:focus{outline:none;border-color:#c8a986;box-shadow:0 0 0 3px rgba(150,104,63,.10)}
-  button{
-    font:inherit;font-size:13px;padding:6px 18px;border-radius:6px;cursor:pointer;
-    background:var(--accent);border:1px solid var(--accent-d);color:#fdfaf4;letter-spacing:.3px;
-  }
-  button:hover{background:var(--accent-d)}
-  button:disabled{opacity:.5;cursor:not-allowed}
-  .muted{color:var(--ink-3);font-size:12px;margin-left:10px}
-  .ok{color:var(--ok)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:20px 22px;
+    box-shadow:0 2px 8px rgba(120,95,60,.05);margin-bottom:16px;animation:rise .25s ease both}
+  .card:nth-of-type(3){animation-delay:.035s}.card:nth-of-type(4){animation-delay:.07s}
+  .card:nth-of-type(5){animation-delay:.105s}
+  @keyframes rise{from{opacity:0;transform:translateY(7px)}}
+  h2{font-size:13px;margin:0 0 3px;letter-spacing:.5px}h2+div{margin-bottom:17px}
+  .row{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px}.row:last-child{margin-bottom:0}
+  .field{display:flex;flex-direction:column;gap:5px;min-width:130px;flex:1}.field.small{flex:0;min-width:120px}
+  .field label,.label{font-size:11px;letter-spacing:.35px;color:var(--ink3)}
+  input,select,textarea{font:inherit;font-size:13px;color:var(--ink);background:#fffdf9;width:100%;
+    border:1px solid var(--line);border-radius:7px;padding:7px 10px;transition:border-color .15s,box-shadow .15s}
+  textarea{resize:vertical;line-height:1.6}
+  body.dark input,body.dark select,body.dark textarea{background:#231e18}
+  input:focus,select:focus,textarea:focus{outline:none;border-color:#c8a986;box-shadow:0 0 0 3px rgba(150,104,63,.10)}
+  .check{display:flex;align-items:center;gap:9px;padding:8px 0;cursor:pointer;flex:1;min-width:220px}
+  .check input{width:16px;height:16px;accent-color:var(--accent);margin:0}.check span{font-size:12.5px}
+  .hint{font-size:11.5px;color:var(--ink3);line-height:1.6}.warn{color:var(--crit)}
+  button{position:relative;overflow:hidden;font:inherit;font-size:12.5px;padding:6px 16px;border-radius:7px;
+    cursor:pointer;background:var(--accent);border:1px solid var(--accentd);color:#fdfaf4;
+    transition:transform .12s,background .12s,box-shadow .12s;box-shadow:0 1px 2px rgba(125,85,51,.16)}
+  button:hover{background:var(--accentd);transform:translateY(-1px)}button:active{transform:translateY(1px) scale(.98)}
+  button:disabled{opacity:.5;cursor:not-allowed;transform:none}.ghost{background:transparent;color:var(--ink2);
+    border-color:var(--line);box-shadow:none}.ghost:hover{background:var(--panel2);color:var(--ink)}
+  .danger{color:var(--crit);border-color:color-mix(in srgb,var(--crit) 35%,var(--line))}
+  .actions{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.actions .field{max-width:250px}
+  .savebar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);width:min(850px,calc(100% - 40px));
+    display:flex;align-items:center;gap:12px;padding:11px 14px;border:1px solid var(--line);border-radius:12px;
+    background:color-mix(in srgb,var(--panel) 92%,transparent);backdrop-filter:blur(12px);
+    box-shadow:0 8px 30px rgba(70,50,30,.14);z-index:5}
+  .savebar .sp{flex:1}.muted{color:var(--ink3);font-size:12px}.ok{color:var(--ok)}
+  .host{border:1px solid var(--soft);border-radius:8px;padding:9px 11px;margin-top:7px;display:flex;gap:12px;
+    align-items:center;animation:rise .18s ease}.host .fp{min-width:0;flex:1}.host code{display:block;font-size:11px;
+    color:var(--ink2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.host b{font-size:12px}
+  .empty{padding:12px;border:1px dashed var(--line);border-radius:8px;color:var(--ink3);font-size:12px;margin-top:8px}
+  .ripple{position:absolute;border-radius:50%;background:currentColor;opacity:.12;pointer-events:none;
+    transform:scale(0);animation:rip .42s ease-out}@keyframes rip{to{transform:scale(3);opacity:0}}
+  .toast{position:fixed;left:50%;bottom:86px;transform:translate(-50%,10px);background:var(--ink);color:var(--panel);
+    padding:8px 16px;border-radius:20px;font-size:12px;opacity:0;pointer-events:none;transition:.18s;z-index:8}
+  .toast.show{opacity:1;transform:translate(-50%,0)}
+  @media(max-width:600px){body{padding:24px 12px 92px}.card{padding:17px 15px}.field.small{flex:1}.savebar{width:calc(100% - 24px)}}
+  @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
 </style>
 </head>
 <body>
 <script>try{if(localStorage.getItem('artex_theme')==='1')document.body.classList.add('dark')}catch(e){}</script>
 <div class="wrap">
-  <div class="head">
-    <div><div class="brand">ARTEX Controller</div><div class="sub" data-i18n="sub">全局设置</div></div>
-    <a class="back" href="/" data-i18n="back">← 返回控制台</a>
-  </div>
-  <div class="card">
-    <div class="row" style="margin-bottom:0">
-      <div class="field" style="flex:1">
-        <label data-i18n="lang">语言</label>
-        <select id="lang">
-          <option value="zh">简体中文</option>
-          <option value="en">English</option>
-        </select>
-      </div>
-    </div>
-    <div class="row" style="margin:18px 0 0;align-items:center">
-      <button id="save" data-i18n="save">保存</button>
-      <span id="msg" class="muted"></span>
-    </div>
-  </div>
+  <div class="head"><div><div class="brand">ARTEX Controller</div><div class="sub" data-i18n="sub">全局设置</div></div>
+    <a class="back" href="/" data-i18n="back">← 返回控制台</a></div>
+  <section class="card"><h2 data-i18n="ui">界面与刷新</h2><div class="hint" data-i18n="ui_sub">控制默认外观、自动连接和轮询频率</div>
+    <div class="row"><div class="field"><label data-i18n="lang">语言</label><select id="lang"><option value="zh">简体中文</option><option value="en">English</option></select></div>
+      <div class="field"><label data-i18n="theme">默认主题</label><select id="theme"><option value="light" data-i18n="light">浅色</option><option value="dark" data-i18n="dark">深色</option></select></div></div>
+    <div class="row"><div class="field"><label data-i18n="refresh">前台刷新间隔（秒）</label><input id="refresh_seconds" type="number" min="3" max="120"></div>
+      <div class="field"><label data-i18n="background_refresh">后台刷新间隔（秒）</label><input id="background_refresh_seconds" type="number" min="10" max="600"></div></div>
+    <div class="row"><label class="check"><input id="auto_connect" type="checkbox"><span data-i18n="auto_connect">启动后自动连接已保存凭据的机器</span></label>
+      <label class="check"><input id="desktop_notifications" type="checkbox"><span data-i18n="notifications">后台出现新严重 / 高危漏洞时发送系统通知</span></label></div>
+  </section>
+  <section class="card"><h2 data-i18n="task_defaults">任务默认值</h2><div class="hint" data-i18n="task_sub">新任务将使用这些参数，单台下发时仍可临时修改</div>
+    <div class="row"><div class="field"><label data-i18n="timeout">默认时长（分钟）</label><input id="timeout_minutes" type="number" min="1" max="10080"></div>
+      <div class="field"><label data-i18n="heartbeat">计划心跳（分钟）</label><input id="plan_heartbeat_minutes" type="number" min="1" max="120"></div>
+      <div class="field"><label>LLM</label><input id="llm" data-i18n-ph="llm_ph" placeholder="服务器默认"></div></div>
+    <div class="row"><div class="field"><label data-i18n="test_prefix">测试任务前缀</label><input id="test_prefix"></div></div>
+    <div class="row"><label class="check"><input id="coverage_enabled" type="checkbox"><span data-i18n="coverage">启用覆盖检查</span></label>
+      <label class="check"><input id="seed_first_intent" type="checkbox"><span data-i18n="seed">生成首个意图</span></label></div>
+    <div class="field"><label data-i18n="goal">固定目标模板</label><textarea id="goal" rows="5"></textarea></div>
+  </section>
+  <section class="card"><h2 data-i18n="connection">连接与安全</h2><div class="hint" data-i18n="conn_sub">机器单独填写的端口和账号优先于这里的默认值</div>
+    <div class="row"><div class="field"><label data-i18n="artex_port">ARTEX 默认端口</label><input id="default_artex_port" type="number" min="1" max="65535"></div>
+      <div class="field"><label data-i18n="ssh_timeout">SSH 超时（秒）</label><input id="ssh_timeout" type="number" min="3" max="60"></div>
+      <div class="field"><label data-i18n="reconnect_seconds">重连基础间隔（秒）</label><input id="reconnect_seconds" type="number" min="3" max="120"></div></div>
+    <div class="row"><div class="field"><label data-i18n="login_user">ARTEX 默认账号</label><input id="login_user" autocomplete="username"></div>
+      <div class="field"><label data-i18n="login_password">ARTEX 默认密码</label><input id="login_password" type="password" autocomplete="current-password"></div></div>
+    <div class="row"><label class="check"><input id="auto_reconnect" type="checkbox"><span data-i18n="auto_reconnect">连接中断后自动重连（指数退避）</span></label></div>
+    <div class="hint warn" data-i18n="plaintext">密码以明文保存在本机 config.toml，请控制文件权限且不要提交到仓库。</div>
+  </section>
+  <section class="card"><h2 data-i18n="data">数据与维护</h2><div class="hint" data-i18n="data_sub">管理报告位置、配置备份、任务顺序和受信任主机密钥</div>
+    <div class="row"><div class="field"><label data-i18n="export_dir">报告导出目录（相对于程序目录）</label><input id="export_dir"></div></div>
+    <div class="actions"><button class="ghost" id="open-config" data-i18n="open_config">打开配置目录</button>
+      <button class="ghost" id="open-export" data-i18n="open_export">打开报告目录</button>
+      <button class="ghost" id="backup" data-i18n="backup">立即备份配置</button><span id="backup-state" class="hint"></span></div>
+    <hr style="border:0;border-top:1px solid var(--soft);margin:18px 0">
+    <div class="label" data-i18n="reset_order">重置任务展示顺序</div>
+    <div class="actions" style="margin-top:7px"><select id="order-machine" style="max-width:280px"></select>
+      <button class="ghost danger" id="reset-order" data-i18n="reset">重置</button></div>
+    <div class="label" style="margin-top:18px" data-i18n="host_keys">已信任主机密钥</div>
+    <div id="host-keys"></div>
+  </section>
+  <div class="hint" style="text-align:center;margin:22px 0">ARTEX Controller · 127.0.0.1 · <span data-i18n="local_only">仅本机访问</span></div>
 </div>
+<div class="savebar"><span id="msg" class="muted"></span><span class="sp"></span><button id="save" data-i18n="save">保存设置</button></div>
+<div id="toast" class="toast"></div>
 <script>
-let LANG = 'zh';
-const D = {
-  zh: {
-    sub: '设置', back: '← 返回控制台', lang: '语言',
-    save: '保存', saving: '保存中…', saved: '已保存', fail: '保存失败', req_fail: '请求失败：'
-  },
-  en: {
-    sub: 'Settings', back: '← Back to console', lang: 'Language',
-    save: 'Save', saving: 'Saving…', saved: 'Saved', fail: 'Save failed', req_fail: 'Request failed: '
-  }
+let LANG='zh', SETTINGS={};
+const D={
+ zh:{sub:'全局设置',back:'← 返回控制台',ui:'界面与刷新',ui_sub:'控制默认外观、自动连接和轮询频率',lang:'语言',theme:'默认主题',light:'浅色',dark:'深色',refresh:'前台刷新间隔（秒）',background_refresh:'后台刷新间隔（秒）',auto_connect:'启动后自动连接已保存凭据的机器',notifications:'后台出现新严重 / 高危漏洞时发送系统通知',task_defaults:'任务默认值',task_sub:'新任务将使用这些参数，单台下发时仍可临时修改',timeout:'默认时长（分钟）',heartbeat:'计划心跳（分钟）',llm_ph:'服务器默认',test_prefix:'测试任务前缀',coverage:'启用覆盖检查',seed:'生成首个意图',goal:'固定目标模板',connection:'连接与安全',conn_sub:'机器单独填写的端口和账号优先于这里的默认值',artex_port:'ARTEX 默认端口',ssh_timeout:'SSH 超时（秒）',reconnect_seconds:'重连基础间隔（秒）',login_user:'ARTEX 默认账号',login_password:'ARTEX 默认密码',auto_reconnect:'连接中断后自动重连（指数退避）',plaintext:'密码以明文保存在本机 config.toml，请控制文件权限且不要提交到仓库。',data:'数据与维护',data_sub:'管理报告位置、配置备份、任务顺序和受信任主机密钥',export_dir:'报告导出目录（相对于程序目录）',open_config:'打开配置目录',open_export:'打开报告目录',backup:'立即备份配置',reset_order:'重置任务展示顺序',reset:'重置',host_keys:'已信任主机密钥',local_only:'仅本机访问',save:'保存设置',saving:'保存中…',saved:'设置已保存',fail:'保存失败',req_fail:'请求失败：',no_keys:'尚未记录主机密钥，首次 SSH 连接后会显示在这里。',no_machines:'没有可重置的机器',delete_key:'删除',delete_confirm:'确认删除 {1} 的受信任密钥？下次连接会重新记录，请确认目标主机可信。',reset_confirm:'确认重置 {1} 的任务顺序？',done:'操作完成',backup_exists:'已有 config.toml.bak'},
+ en:{sub:'Settings',back:'← Back to console',ui:'Interface & refresh',ui_sub:'Default appearance, startup connections and polling frequency',lang:'Language',theme:'Default theme',light:'Light',dark:'Dark',refresh:'Foreground refresh interval (sec)',background_refresh:'Background refresh interval (sec)',auto_connect:'Connect machines with saved credentials at startup',notifications:'Send system notifications for new critical/high findings in background',task_defaults:'Task defaults',task_sub:'Used for new tasks; individual dispatches can still override them',timeout:'Default duration (min)',heartbeat:'Plan heartbeat (min)',llm_ph:'Server default',test_prefix:'Test task prefix',coverage:'Enable coverage checks',seed:'Generate first intent',goal:'Fixed goal template',connection:'Connection & security',conn_sub:'Per-machine ports and credentials override these defaults',artex_port:'Default ARTEX port',ssh_timeout:'SSH timeout (sec)',reconnect_seconds:'Reconnect base delay (sec)',login_user:'Default ARTEX user',login_password:'Default ARTEX password',auto_reconnect:'Reconnect automatically after connection loss (exponential backoff)',plaintext:'Passwords are stored in plaintext in local config.toml. Protect the file and never commit it.',data:'Data & maintenance',data_sub:'Manage reports, configuration backups, task order and trusted host keys',export_dir:'Report export directory (relative to app)',open_config:'Open config folder',open_export:'Open report folder',backup:'Back up config now',reset_order:'Reset task display order',reset:'Reset',host_keys:'Trusted host keys',local_only:'local access only',save:'Save settings',saving:'Saving…',saved:'Settings saved',fail:'Save failed',req_fail:'Request failed: ',no_keys:'No host keys yet. They appear after the first SSH connection.',no_machines:'No machines to reset',delete_key:'Delete',delete_confirm:'Delete the trusted key for {1}? The next connection will trust a new key; verify the host first.',reset_confirm:'Reset task order for {1}?',done:'Done',backup_exists:'config.toml.bak exists'}
 };
-const $ = id => document.getElementById(id);
-function T(k){ return (D[LANG] || D.zh)[k] || D.zh[k] || k; }
-function applyLang(){
-  document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = T(el.dataset.i18n); });
-  document.querySelectorAll('[data-i18n-ph]').forEach(el => { el.placeholder = T(el.dataset.i18nPh); });
-  document.documentElement.lang = LANG === 'en' ? 'en' : 'zh-CN';
-  document.title = LANG === 'en' ? 'ARTEX · Settings' : 'ARTEX · 设置';
-}
-async function load(){
-  const d = await (await fetch('/api/settings')).json();
-  LANG = d.lang === 'en' ? 'en' : 'zh';
-  $('lang').value = LANG;
-  applyLang();
-}
-$('lang').onchange = (e) => { LANG = e.target.value; applyLang(); };
-$('save').onclick = async () => {
-  $('save').disabled = true;
-  $('msg').textContent = T('saving'); $('msg').className = 'muted';
-  try {
-    const r = await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'},
-                                            body: JSON.stringify({lang: $('lang').value})});
-    const d = await r.json();
-    if (d.ok){ $('msg').textContent = T('saved'); $('msg').className = 'muted ok'; }
-    else { $('msg').textContent = d.error || T('fail'); $('msg').className = 'muted'; }
-  } catch(e){ $('msg').textContent = T('req_fail') + e; $('msg').className = 'muted'; }
-  finally { $('save').disabled = false; }
-};
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function T(k,...a){let s=(D[LANG]||D.zh)[k]||D.zh[k]||k;a.forEach((v,i)=>s=s.split('{'+(i+1)+'}').join(v));return s}
+function applyLang(){document.querySelectorAll('[data-i18n]').forEach(el=>el.textContent=T(el.dataset.i18n));document.querySelectorAll('[data-i18n-ph]').forEach(el=>el.placeholder=T(el.dataset.i18nPh));document.documentElement.lang=LANG==='en'?'en':'zh-CN';document.title=LANG==='en'?'ARTEX · Settings':'ARTEX · 设置';renderHosts()}
+function applyTheme(theme){document.body.classList.toggle('dark',theme==='dark');try{localStorage.setItem('artex_theme',theme==='dark'?'1':'0')}catch(e){}}
+async function api(path,body){const r=await fetch(path,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});return await r.json()}
+const keys=['lang','theme','refresh_seconds','background_refresh_seconds','auto_connect','desktop_notifications','timeout_minutes','plan_heartbeat_minutes','llm','test_prefix','coverage_enabled','seed_first_intent','goal','default_artex_port','ssh_timeout','reconnect_seconds','login_user','login_password','auto_reconnect','export_dir'];
+function fill(d){SETTINGS=d;LANG=d.lang==='en'?'en':'zh';keys.forEach(k=>{const el=$(k);if(!el)return;if(el.type==='checkbox')el.checked=!!d[k];else el.value=d[k]==null?'':d[k]});$('order-machine').innerHTML=(d.machines||[]).map(m=>'<option value="'+esc(m.ip)+'">'+esc(m.ip)+(m.label?' · '+esc(m.label):'')+'</option>').join('')||'<option value="">'+esc(T('no_machines'))+'</option>';$('backup-state').textContent=d.config_backup_exists?T('backup_exists'):'';applyLang()}
+async function load(){try{fill(await api('/api/settings'))}catch(e){$('msg').textContent=T('req_fail')+e}}
+function renderHosts(){const items=SETTINGS.host_keys||[];$('host-keys').innerHTML=items.length?items.map(h=>'<div class="host"><div class="fp"><b>'+esc(h.tag)+'</b><code title="'+esc(h.fingerprint)+'">'+esc(h.fingerprint)+'</code></div><button class="ghost danger del-key" data-tag="'+esc(h.tag)+'">'+esc(T('delete_key'))+'</button></div>').join(''):'<div class="empty">'+esc(T('no_keys'))+'</div>';document.querySelectorAll('.del-key').forEach(b=>b.onclick=()=>maintenance('delete_host_key',{tag:b.dataset.tag},T('delete_confirm',b.dataset.tag)))}
+function payload(){const p={};keys.forEach(k=>{const el=$(k);p[k]=el.type==='checkbox'?el.checked:el.value});['refresh_seconds','background_refresh_seconds','timeout_minutes','plan_heartbeat_minutes','default_artex_port','ssh_timeout','reconnect_seconds'].forEach(k=>p[k]=parseInt(p[k],10));return p}
+let toastTimer;function toast(s){$('toast').textContent=s;$('toast').classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').classList.remove('show'),2200)}
+async function maintenance(action,extra,confirmation){if(confirmation&&!confirm(confirmation))return;try{const d=await api('/api/maintenance',Object.assign({action},extra||{}));if(!d.ok){toast(d.error||T('fail'));return}toast(d.message||T('done'));if(action==='delete_host_key'||action==='backup_config')fill(await api('/api/settings'))}catch(e){toast(T('req_fail')+e)}}
+$('lang').onchange=e=>{LANG=e.target.value;applyLang()};$('theme').onchange=e=>applyTheme(e.target.value);
+$('open-config').onclick=()=>maintenance('open_config_dir');$('open-export').onclick=()=>maintenance('open_export_dir');$('backup').onclick=()=>maintenance('backup_config');
+$('reset-order').onclick=()=>{const ip=$('order-machine').value;if(ip)maintenance('reset_order',{ip},T('reset_confirm',ip))};
+$('save').onclick=async()=>{const p=payload();if(p.desktop_notifications&&!SETTINGS.desktop_notifications&&'Notification'in window&&Notification.permission==='default'){try{await Notification.requestPermission()}catch(e){}}$('save').disabled=true;$('msg').className='muted';$('msg').textContent=T('saving');try{const d=await api('/api/settings',p);if(d.ok){fill(d.settings);applyTheme(d.settings.theme);$('msg').className='muted ok';$('msg').textContent=T('saved');toast(T('saved'))}else{$('msg').textContent=d.error||T('fail')}}catch(e){$('msg').textContent=T('req_fail')+e}finally{$('save').disabled=false}};
+document.addEventListener('pointerdown',e=>{const b=e.target.closest('button');if(!b||b.disabled||matchMedia('(prefers-reduced-motion: reduce)').matches)return;const r=document.createElement('span'),box=b.getBoundingClientRect(),size=Math.max(box.width,box.height);r.className='ripple';r.style.cssText='width:'+size+'px;height:'+size+'px;left:'+(e.clientX-box.left-size/2)+'px;top:'+(e.clientY-box.top-size/2)+'px';b.appendChild(r);setTimeout(()=>r.remove(),450)});
 load();
 </script>
 </body>
@@ -2152,7 +3049,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/api/machines"):
             d = self.cfg["defaults"]
-            self._json({
+            out = {
                 "machines": [{"ip": m["ip"], "label": m.get("label", ""),
                               "user": m.get("user", "root"), "port": m.get("port", 22),
                               "artex_port": m.get("artex_port") or d.get("artex_port", 8787),
@@ -2164,18 +3061,18 @@ class Handler(BaseHTTPRequestHandler):
                               "has_artex_password": bool(m.get("artex_password")),
                               "key_file": m.get("ssh_key_file", "")}
                              for m in self.cfg["machines"]],
-                "goal": DEFAULT_GOAL,
+                "goal": (d.get("goal") or "").strip() or DEFAULT_GOAL,
                 "timeout_minutes": int(d.get("timeout_minutes", 600)),
                 "llm_key": d.get("llm", ""),
                 "login_user": d.get("login_user", ""),
                 "login_password": d.get("login_password", ""),
                 "default_artex_port": int(d.get("artex_port", 8787)),
-                "lang": (self.cfg.get("console") or {}).get("lang", "zh"),
-            })
+            }
+            out.update(console_options(self.cfg))
+            self._json(out)
             return
         if self.path.startswith("/api/settings"):
-            c = self.cfg.get("console") or {}
-            self._json({"lang": c.get("lang", "zh")})
+            self._json(self._settings_data())
             return
         if self.path.split("?")[0] in ("/settings", "/settings/"):
             body = SETTINGS_HTML.encode("utf-8")
@@ -2230,6 +3127,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/machines/delete"):
             self._json(self._delete_machine(body))
             return
+        if self.path.startswith("/api/task-order"):
+            self._json(self._save_task_order(body))
+            return
+        if self.path.startswith("/api/maintenance"):
+            self._json(self._maintenance(body))
+            return
+        if self.path.startswith("/api/overview"):
+            self._json(self._refresh_all())
+            return
         if self.path.startswith("/api/poll"):
             self._json(self._poll(body))
             return
@@ -2241,6 +3147,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/api/open-dir"):
             self._json(self._open_dir(body))
+            return
+        if self.path.startswith("/api/export-status"):
+            self._json(self._export_status(body))
+            return
+        if self.path.startswith("/api/ask-history"):
+            ip = str(body.get("ip") or "")
+            tid = str(body.get("task_id") or "")
+            if not any(m["ip"] == ip for m in self.cfg["machines"]) or not tid.isdigit():
+                self._json({"ok": False, "error": "任务或主机无效"}, 404)
+            else:
+                self._json({"ok": True, "items": get_ask_history(ip, tid)})
             return
 
         machine = next((m for m in self.cfg["machines"] if m["ip"] == body.get("ip")), None)
@@ -2288,6 +3205,8 @@ class Handler(BaseHTTPRequestHandler):
                             "model": p.get("model"), "is_default": bool(p.get("is_default"))}
                            for p in profs]
             out["fetched_at"] = time.time()
+            out["connected"] = bool(conn_get(machine["ip"]))
+            out["task_order"] = get_task_order(machine["ip"])
             return out
         except paramiko.AuthenticationException:
             return {"ok": False, "ip": machine["ip"], "error": "SSH 认证失败：密码不对"}
@@ -2301,6 +3220,8 @@ class Handler(BaseHTTPRequestHandler):
         results = []
 
         def one(m):
+            if not (m.get("ssh_password") or m.get("ssh_key_file")):
+                return {"ok": False, "ip": m["ip"], "error": "未保存 SSH 凭据"}
             try:
                 return self._refresh(m, "")
             except Exception as e:
@@ -2315,16 +3236,43 @@ class Handler(BaseHTTPRequestHandler):
         tid = str(body.get("task_id") or "").strip()
         if not tid.isdigit():
             return {"ok": False, "error": "任务 id 无效"}
+        ip = machine["ip"]
+        with _EXPORT_LOCK:
+            if any(j.get("status") == "running" and j.get("ip") == ip and j.get("task_id") == tid
+                   for j in _EXPORT_JOBS.values()):
+                return {"ok": False, "error": "该任务已有导出正在进行"}
+            job_id = uuid.uuid4().hex
+            _EXPORT_JOBS[job_id] = {"status": "running", "stage": "report", "ip": ip,
+                                    "task_id": tid, "created": time.time()}
+            for old_id, job in list(_EXPORT_JOBS.items()):
+                if time.time() - job.get("created", 0) > 3600:
+                    _EXPORT_JOBS.pop(old_id, None)
         name = (body.get("task_name") or "").strip() or ("task_" + tid)
-        try:
-            with client_ctx(self.cfg, machine, password) as c:
-                res = export_task(c, machine["ip"], tid, name)
-            res["ok"] = True
-            return res
-        except paramiko.AuthenticationException:
-            return {"ok": False, "error": "SSH 认证失败：密码不对"}
-        except Exception as e:
-            return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:160])}
+
+        def run():
+            def progress(stage):
+                with _EXPORT_LOCK:
+                    _EXPORT_JOBS[job_id]["stage"] = stage
+            try:
+                with client_ctx(self.cfg, machine, password) as c:
+                    res = export_task(c, ip, tid, name, progress)
+                res.update({"ok": True, "status": "done", "stage": "done"})
+            except Exception as e:
+                res = {"ok": False, "status": "error", "stage": "error",
+                       "error": "%s: %s" % (type(e).__name__, str(e)[:240])}
+            with _EXPORT_LOCK:
+                _EXPORT_JOBS[job_id].update(res)
+
+        threading.Thread(target=run, daemon=True, name="export-" + tid).start()
+        return {"ok": True, "job_id": job_id, "status": "running"}
+
+    def _export_status(self, body):
+        job_id = str(body.get("job_id") or "")
+        with _EXPORT_LOCK:
+            job = _EXPORT_JOBS.get(job_id)
+            if not job:
+                return {"ok": False, "error": "导出任务不存在或已过期"}
+            return dict(job)
 
     def _open_dir(self, body):
         root = os.path.abspath(EXPORT_ROOT)
@@ -2340,13 +3288,132 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def _settings_data(self):
+        d = self.cfg.get("defaults") or {}
+        out = console_options(self.cfg)
+        out.update({
+            "default_artex_port": int(d.get("artex_port", 8787)),
+            "login_user": d.get("login_user", "ARTEX"),
+            "login_password": d.get("login_password", ""),
+            "llm": d.get("llm", ""),
+            "timeout_minutes": int(d.get("timeout_minutes", 600)),
+            "plan_heartbeat_minutes": int(d.get("plan_heartbeat_minutes", 10)),
+            "coverage_enabled": bool(d.get("coverage_enabled", True)),
+            "seed_first_intent": bool(d.get("seed_first_intent", False)),
+            "test_prefix": d.get("test_prefix", "[DISPATCH-TEST]"),
+            "goal": d.get("goal", ""),
+            "machines": [{"ip": m["ip"], "label": m.get("label", "")}
+                         for m in self.cfg["machines"]],
+            "host_keys": [{"tag": k, "fingerprint": v}
+                          for k, v in sorted(_load_known_hosts().items())],
+            "config_backup_exists": os.path.isfile(_CONFIG_PATH + ".bak"),
+        })
+        return out
+
     def _save_settings(self, body):
-        lang = body.get("lang")
-        if lang not in ("zh", "en"):
-            return {"ok": False, "error": "语言不合法"}
-        self.cfg.setdefault("console", {})["lang"] = lang
-        save_config(self.cfg)
-        return {"ok": True}
+        if body.get("lang") not in ("zh", "en") or body.get("theme") not in ("light", "dark"):
+            return {"ok": False, "error": "语言或主题不合法"}
+
+        def bounded(key, low, high):
+            try:
+                value = int(body.get(key))
+            except Exception:
+                raise ValueError("%s 必须是整数" % key)
+            if not low <= value <= high:
+                raise ValueError("%s 应在 %d–%d 之间" % (key, low, high))
+            return value
+
+        try:
+            values = {
+                "refresh_seconds": bounded("refresh_seconds", 3, 120),
+                "background_refresh_seconds": bounded("background_refresh_seconds", 10, 600),
+                "reconnect_seconds": bounded("reconnect_seconds", 3, 120),
+                "ssh_timeout": bounded("ssh_timeout", 3, 60),
+                "default_artex_port": bounded("default_artex_port", 1, 65535),
+                "timeout_minutes": bounded("timeout_minutes", 1, 10080),
+                "plan_heartbeat_minutes": bounded("plan_heartbeat_minutes", 1, 120),
+            }
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        export_dir = str(body.get("export_dir") or "machine").strip()
+        candidate = os.path.abspath(os.path.join(HERE, export_dir))
+        if (not export_dir or os.path.isabs(export_dir) or candidate == os.path.abspath(HERE)
+                or not candidate.startswith(os.path.abspath(HERE) + os.sep)):
+            return {"ok": False, "error": "导出目录必须是程序目录内的子目录"}
+        goal = str(body.get("goal") or "")
+        if len(goal) > 100000:
+            return {"ok": False, "error": "目标模板过长"}
+
+        c = self.cfg.setdefault("console", {})
+        c.update(values)
+        c.update({
+            "lang": body["lang"], "theme": body["theme"],
+            "refresh_seconds": values["refresh_seconds"],
+            "background_refresh_seconds": values["background_refresh_seconds"],
+            "reconnect_seconds": values["reconnect_seconds"],
+            "ssh_timeout": values["ssh_timeout"],
+            "auto_connect": bool(body.get("auto_connect")),
+            "auto_reconnect": bool(body.get("auto_reconnect")),
+            "desktop_notifications": bool(body.get("desktop_notifications")),
+            "export_dir": os.path.relpath(candidate, HERE).replace("\\", "/"),
+        })
+        c.pop("default_artex_port", None)
+        c.pop("timeout_minutes", None)
+        c.pop("plan_heartbeat_minutes", None)
+        d = self.cfg.setdefault("defaults", {})
+        d.update({
+            "artex_port": values["default_artex_port"],
+            "login_user": str(body.get("login_user") or "").strip(),
+            "login_password": str(body.get("login_password") or ""),
+            "llm": str(body.get("llm") or "").strip(),
+            "timeout_minutes": values["timeout_minutes"],
+            "plan_heartbeat_minutes": values["plan_heartbeat_minutes"],
+            "coverage_enabled": bool(body.get("coverage_enabled")),
+            "seed_first_intent": bool(body.get("seed_first_intent")),
+            "test_prefix": str(body.get("test_prefix") or ""),
+            "goal": goal,
+        })
+        try:
+            save_config(self.cfg)
+            apply_export_dir(self.cfg)
+        except Exception as e:
+            return {"ok": False, "error": "配置写入失败：%s" % e}
+        return {"ok": True, "settings": self._settings_data()}
+
+    def _maintenance(self, body):
+        action = str(body.get("action") or "")
+        if action == "backup_config":
+            try:
+                save_config(self.cfg)
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "message": "已备份为 config.toml.bak"}
+        if action == "reset_order":
+            ip = str(body.get("ip") or "")
+            if not any(m["ip"] == ip for m in self.cfg["machines"]):
+                return {"ok": False, "error": "未知主机"}
+            drop_task_order(ip)
+            return {"ok": True}
+        if action == "delete_host_key":
+            tag = str(body.get("tag") or "")
+            known = _load_known_hosts()
+            if tag not in known:
+                return {"ok": False, "error": "主机密钥不存在"}
+            del known[tag]
+            _save_known_hosts(known)
+            return {"ok": True}
+        if action in ("open_config_dir", "open_export_dir"):
+            path = HERE if action == "open_config_dir" else EXPORT_ROOT
+            try:
+                os.makedirs(path, exist_ok=True)
+                if os.name == "nt":
+                    os.startfile(path)
+                else:
+                    subprocess.Popen(["xdg-open", path])
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": "未知维护操作"}
 
     def _save_machine(self, body):
         ip = (body.get("ip") or "").strip()
@@ -2409,6 +3476,8 @@ class Handler(BaseHTTPRequestHandler):
             item.pop("ssh_key_file", None)
 
         save_config(self.cfg)
+        if old_ip != ip:
+            move_task_order(old_ip, ip)
         conn_close(old_ip)
         conn_close(ip)
         return {"ok": True, "ip": ip}
@@ -2420,8 +3489,26 @@ class Handler(BaseHTTPRequestHandler):
         if len(self.cfg["machines"]) == before:
             return {"ok": False, "error": "没有这台机器"}
         conn_close(ip)
+        drop_task_order(ip)
         save_config(self.cfg)
         return {"ok": True, "ip": ip}
+
+    def _save_task_order(self, body):
+        ip = str(body.get("ip") or "").strip()
+        if not any(m["ip"] == ip for m in self.cfg["machines"]):
+            return {"ok": False, "error": "未知主机"}
+        order = body.get("order")
+        if not isinstance(order, list) or len(order) > 5000:
+            return {"ok": False, "error": "排序数据不合法"}
+        clean = []
+        for x in order:
+            s = str(x).strip()
+            if not s.isdigit() or len(s) > 20:
+                return {"ok": False, "error": "排序数据不合法"}
+            clean.append(s)
+        if not set_task_order(ip, clean):
+            return {"ok": False, "error": "排序写入失败"}
+        return {"ok": True, "order": clean}
 
     def _connect(self, machine, password):
         ip = machine["ip"]
@@ -2462,6 +3549,7 @@ class Handler(BaseHTTPRequestHandler):
                 tasks = c["client"].tasks()
             res = summarize(tasks)
             res.update({"ok": True, "connected": True, "ip": ip, "fetched_at": time.time()})
+            res["task_order"] = get_task_order(ip)
             return res
         except Exception as e:
             conn_close(ip)
@@ -2527,8 +3615,11 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": False, "error": "内容为空"}
         try:
             with client_ctx(self.cfg, machine, password) as c:
-                return ask_main_agent(c, tid, msg,
-                                      timeout=int(body.get("timeout") or 240))
+                result = ask_main_agent(c, tid, msg,
+                                        timeout=int(body.get("timeout") or 240))
+            append_ask_history(machine["ip"], tid, msg, result)
+            result["history"] = get_ask_history(machine["ip"], tid)
+            return result
         except paramiko.AuthenticationException:
             return {"ok": False, "error": "SSH 认证失败：密码不对"}
         except Exception as e:
@@ -2555,7 +3646,7 @@ class Handler(BaseHTTPRequestHandler):
             if not desc:
                 desc = "渗透%s源站及其子站" % name
             if not goal_text:
-                goal_text = DEFAULT_GOAL
+                goal_text = (d.get("goal") or "").strip() or DEFAULT_GOAL
 
         try:
             with client_ctx(self.cfg, machine, password) as c:
@@ -2657,6 +3748,7 @@ def main():
     global _CONFIG_PATH
     _CONFIG_PATH = os.path.abspath(args.config)
     cfg = load_config(args.config)
+    apply_export_dir(cfg)
     Handler.cfg = cfg
     port = args.port or int(cfg["console"].get("port", 8900))
 

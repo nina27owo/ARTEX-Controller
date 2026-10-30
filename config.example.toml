@@ -15,14 +15,27 @@ plan_heartbeat_minutes = 10
 coverage_enabled = true
 seed_first_intent = false
 test_prefix = "[DISPATCH-TEST]"
-# 命令行工具 artex_dispatch.py 的默认目标；网页控制台下发任务默认使用「获取权限」
+# 固定目标模板：不继承任务时，网页控制台和 artex_dispatch.py 都用这段目标下发
 goal = """在此填写固定的任务目标模板。"""
 
 [console]
 # 控制台网页端口，打开 http://127.0.0.1:8900
 port = 8900
-# 界面语言：zh / en（也可在设置页面切换）
+# 界面语言与默认主题；主题也可在侧栏底部临时切换
 lang = "zh"
+theme = "light"              # light / dark
+# 前台 / 后台自动刷新间隔（秒）
+refresh_seconds = 8
+background_refresh_seconds = 30
+# 启动后自动连接已保存凭据的机器；断线后自动重连
+# auto_connect = false
+auto_reconnect = true
+reconnect_seconds = 15
+ssh_timeout = 12
+# 后台出现新严重 / 高危漏洞时发送系统通知（需浏览器授权）
+desktop_notifications = false
+# 报告导出目录，必须位于程序目录内
+export_dir = "machine"
 
 # 可选：LLM 显示名映射（不影响服务器端配置）
 # [[llm]]

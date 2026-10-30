@@ -6,29 +6,31 @@
 
 ## 功能
 
-- **服务器列表**：添加 / 编辑 / 删除；支持密码或私钥登录；侧栏可折叠
-- **SSH 隧道**：把目标机的 ARTEX 端口映射到本地随机端口，网页端无感访问；主机密钥首次记录、之后逐次校验
-- **面试板**：任务总数、运行中、暂停、严重 / 高危 / 中危 / 低危、进行中意图
-- **最近任务**：按 ID 倒序，支持暂停 / 继续、选中后导出报告
-- **下发任务**：名称、时长、LLM（用服务器上已配好的）、可选继承已有任务；描述自动生成、目标默认「获取权限」，两者均可临时编辑
-- **提问主 Agent**：对选中任务发指令并查看回复（Ctrl+Enter 发送）
-- **导出报告**：总报告 + 全部严重 / 高危单漏洞报告，落到 `machine/<IP>/<任务名>/`
-- **界面**：夜间模式（侧栏底部）、简体中文 / English（独立设置页，写入 `config.toml`）
+- **服务器列表**：添加 / 编辑 / 删除；支持密码或私钥登录；侧栏可折叠；再次点击当前机器可取消选中并返回首页；「全部服务器」总览可跨机器查看状态并手动刷新
+- **SSH 隧道**：把目标机的 ARTEX 端口映射到本地随机端口，网页端无感访问；主机密钥首次记录、之后逐次校验；断线自动重连，手动断开不会被重新连接
+- **任务看板**：任务总数、运行中、暂停、严重 / 高危 / 中危 / 低危、进行中意图；点击指标卡可直接筛选任务
+- **最近任务**：默认展示 5 条；「全部任务」弹窗可拖动任务块调整顺序，保存后按该顺序展示（按机器记忆），支持暂停 / 继续、选中后导出报告
+- **下发任务**：名称、时长、LLM（用服务器上已配好的）、可选继承已有任务；描述自动生成、目标取自 `config.toml` 的 `[defaults].goal`，两者均可临时编辑
+- **提问主 Agent**：对选中任务发指令并查看回复（Ctrl+Enter 发送）；按机器和任务保留最近 20 条提问记录，支持复制回复
+- **导出报告**：后台导出总报告 + 全部严重 / 高危单漏洞报告，展示阶段进度、数量和失败详情，完成后可直接打开目录
+- **发现提醒**：新的严重 / 高危发现会在侧栏和任务上显示未读标记；可选择在后台发送系统通知
+- **界面**：简体中文 / English、深浅主题、点击反馈与过渡动画、窄窗口侧栏；遵循系统的“减少动态效果”设置
+- **设置**：独立页面管理界面与刷新、任务默认值、连接与重连、导出目录，以及配置备份、主机密钥和任务顺序维护
 - **启动**：`start.bat` 自动检查 Python 与依赖、自动生成配置、把黑窗最小化到任务栏
 
 ## 界面预览
 
 > 截图使用虚构的服务器地址与任务数据（`192.0.2.x`、`example` 域名），不含真实目标信息。
 
-| 主界面 · 概览 / 最近任务 / 下发任务 | 编辑机器 |
+| 主界面 · 最近任务 / 下发任务 | 全部服务器 |
 | --- | --- |
-| ![主界面](docs/images/main.png) | ![编辑机器](docs/images/machine.png) |
+| ![主界面](docs/images/main.png) | ![全部服务器](docs/images/overview.png) |
 
-| 提问主 Agent | 界面 · English |
+| 全部任务 · 拖动排序 | 提问主 Agent · 历史记录 |
 | --- | --- |
-| ![提问主 Agent](docs/images/ask.png) | ![English](docs/images/english.png) |
+| ![全部任务](docs/images/tasks.png) | ![提问主 Agent](docs/images/ask.png) |
 
-| 设置 · 语言 | 夜间模式 |
+| 设置 | 夜间模式 |
 | --- | --- |
 | ![设置](docs/images/settings.png) | ![夜间模式](docs/images/dark.png) |
 
@@ -69,17 +71,31 @@ copy config.example.toml config.toml
 
 ```toml
 [defaults]
-artex_port = 8787           # ARTEX 默认端口
-login_user = "ARTEX"        # ARTEX 网页默认账号
-login_password = "..."      # ARTEX 网页默认密码（机器单独填的优先）
-timeout_minutes = 600       # 下发任务默认时长（分钟）
-goal = """..."""            # artex_dispatch.py 的默认目标（网页控制台默认「获取权限」）
+artex_port = 8787                 # ARTEX 默认端口
+login_user = "ARTEX"              # ARTEX 网页默认账号
+login_password = "..."            # ARTEX 网页默认密码（机器单独填的优先）
+timeout_minutes = 600             # 下发任务默认时长（分钟）
+plan_heartbeat_minutes = 10       # 计划心跳（分钟）
+llm = ""                          # 默认 LLM，留空使用服务器默认值
+test_prefix = "[DISPATCH-TEST]"  # 测试任务名称前缀
+coverage_enabled = true
+seed_first_intent = false
+goal = """..."""                  # 固定目标模板：不继承任务时用这个目标下发
 
 [console]
-port = 8900                 # 控制台网页端口
-lang = "zh"                 # zh / en
+port = 8900                       # 控制台网页端口
+lang = "zh"                       # zh / en
+theme = "light"                   # light / dark
+refresh_seconds = 8               # 前台刷新间隔
+background_refresh_seconds = 30   # 后台刷新间隔
+auto_connect = false              # 启动时连接已保存凭据的机器
+auto_reconnect = true
+reconnect_seconds = 15            # 自动重连基础间隔
+ssh_timeout = 12
+desktop_notifications = false     # 新严重 / 高危发现的系统通知
+export_dir = "machine"           # 必须位于程序目录内
 
-[[machines]]                # 每台服务器一段，由界面维护
+[[machines]]                      # 每台服务器一段，由界面维护
 ip = "192.168.1.10"
 user = "root"
 port = 22
@@ -108,6 +124,7 @@ python artex_console.py [-c config.toml] [--port 8900] [--no-browser]
 ├── config.toml         本地配置（含明文密码，已被 .gitignore 忽略）
 ├── icon.ico            窗口 / 网页图标
 ├── ssh_host_keys.json  SSH 主机密钥指纹（首次连接后生成）
+├── ui_state.json       每台机器的任务展示顺序与提问记录（界面自动保存）
 ├── keys/               私钥文件（使用密钥登录时从界面导入）
 └── machine/            导出的报告
 ```
@@ -117,7 +134,7 @@ python artex_console.py [-c config.toml] [--port 8900] [--no-browser]
 - 网页只监听 `127.0.0.1`，外部访问不到；请求带 Host / Origin 校验，防 DNS rebinding 与跨站调用
 - SSH 主机密钥指纹首次连接时记录到 `ssh_host_keys.json`，之后每次比对，不一致直接拒绝
 - `config.toml` 中是**明文** SSH / ARTEX 密码，请自行控制文件权限，不要提交到仓库
-- `.gitignore` 已排除 `config.toml`、`ssh_host_keys.json`、`keys/`、`machine/`；上传 GitHub 前可用 `git status` 再确认一次
+- `.gitignore` 已排除 `config.toml`、`ssh_host_keys.json`、`ui_state.json`、`keys/`、`machine/`；上传 GitHub 前可用 `git status` 再确认一次
 
 ## 常见问题
 
