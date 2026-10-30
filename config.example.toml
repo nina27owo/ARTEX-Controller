@@ -17,6 +17,8 @@ seed_first_intent = false
 test_prefix = "[DISPATCH-TEST]"
 # 固定目标模板：不继承任务时，网页控制台和 artex_dispatch.py 都用这段目标下发
 goal = """在此填写固定的任务目标模板。"""
+# 任务描述模板：不继承任务时自动生成描述，<名称> 会替换为任务名称
+desc_template = "渗透<名称>源站及其子站"
 
 [console]
 # 控制台网页端口，打开 http://127.0.0.1:8900

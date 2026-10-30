@@ -7,7 +7,7 @@
 1. ↑/↓ 选**一台**主机 → 输入该机 SSH 密码（不落盘，本次运行内记住）
 2. 选 LLM（默认 OpenRouter DeepSeek V4.1 Flash 1017）
 3. 输入要渗透的名称或网址（同时作为任务名称）
-   描述自动生成为「渗透<名称>源站及其子站」，目标固定用 config.toml 的 goal
+   描述按 config.toml 的 desc_template 自动生成（<名称> 替换为名称），目标固定用 goal
    再填任务时长上限（默认 600 分钟）
 4. 确认后下发，打印任务 id / 状态
 5. 下发完选：继续下发这台机器（不用再输密码）/ 使用别的机器
@@ -52,6 +52,7 @@ except ImportError:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = os.path.join(HERE, "config.toml")
+DEFAULT_DESC_TEMPLATE = "渗透<名称>源站及其子站"
 
 
 # --------------------------------------------------------------------------
@@ -611,7 +612,7 @@ def main():
     ap.add_argument("-c", "--config", default=DEFAULT_CONFIG, help="配置文件路径")
     ap.add_argument("-m", "--machine", action="append", default=[], help="指定主机 IP（跳过选择，取第一个）")
     ap.add_argument("-n", "--name", help="要渗透的名称或网址（同时作为任务名称）")
-    ap.add_argument("-d", "--desc", help="覆盖自动生成的描述（默认：渗透<名称>源站及其子站）")
+    ap.add_argument("-d", "--desc", help="覆盖自动生成的描述（默认用 config.toml 的 desc_template）")
     ap.add_argument("-g", "--goal", help="目标（默认用 config.toml 里的 goal）")
     ap.add_argument("-T", "--timeout", type=int, help="任务时长上限（分钟）")
     ap.add_argument("--llm", help="LLM key（默认取配置 defaults.llm）")
@@ -688,7 +689,11 @@ def main():
                 sys.exit(1)
             while not name:
                 name = ask("名称不能为空，输入要渗透的名称或网址").strip()
-        desc = args.desc if args.desc is not None else "渗透%s源站及其子站" % name
+        if args.desc is not None:
+            desc = args.desc
+        else:
+            tpl = str(d.get("desc_template", "")).strip() or DEFAULT_DESC_TEMPLATE
+            desc = tpl.replace("<名称>", name)
         goal = args.goal if args.goal is not None else str(d.get("goal", "")).strip()
         if not goal:
             print("config.toml 里没有 goal，且未用 -g 指定")

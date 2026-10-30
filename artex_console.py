@@ -21,8 +21,10 @@ import contextlib
 import hashlib
 import json
 import os
+import posixpath
 import re
 import select
+import shutil
 import socket
 import socketserver
 import subprocess
@@ -31,6 +33,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
@@ -54,6 +57,7 @@ except ImportError:
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = os.path.join(HERE, "config.toml")
 DEFAULT_GOAL = "获取权限"   # 仅在 config.toml 没写 goal 时兜底
+DEFAULT_DESC_TEMPLATE = "渗透<名称>源站及其子站"   # 仅在 config.toml 没写 desc_template 时兜底
 EXPORT_ROOT = os.path.join(HERE, "machine")
 KNOWN_HOSTS_FILE = os.path.join(HERE, "ssh_host_keys.json")
 UI_STATE_FILE = os.path.join(HERE, "ui_state.json")
@@ -296,6 +300,25 @@ class ArtexClient:
 
     def create_task(self, payload):
         return self._req("POST", "/api/tasks", payload, timeout=60)
+
+    def workspace_list(self, path=""):
+        q = urllib.parse.quote(path or "", safe="")
+        st, res = self._req("GET", "/api/workspace/list?path=" + q)
+        if st != 200:
+            raise RuntimeError("读取目录失败（HTTP %s）%s"
+                               % (st, str((res or {}).get("error") or "")[:120]))
+        return res or {}
+
+    def workspace_stream(self, path, timeout=600):
+        """流式打开工作区文件，调用方负责关闭。"""
+        q = urllib.parse.quote(path or "", safe="")
+        req = urllib.request.Request(self.base + "/api/workspace/download?path=" + q)
+        if self.token:
+            req.add_header("Authorization", "Bearer " + self.token)
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    def delete_task(self, task_id, options):
+        return self._req("DELETE", "/api/tasks/" + str(task_id), options, timeout=180)
 
     def raw(self, path, timeout=120):
         """取原始字节（markdown / zip）。"""
@@ -762,6 +785,196 @@ def export_task(client, ip, task_id, task_name, progress=None):
     return res
 
 
+# --------------------------------------------------------------------------
+# 服务器工作区文件
+# --------------------------------------------------------------------------
+
+_WS_MAX_FILES = 5000
+_WS_MAX_BYTES = 1 << 30          # 打包上限 1 GiB
+_DOWNLOAD_TTL = 1800
+_DOWNLOAD_TICKETS = {}
+_DOWNLOAD_LOCK = threading.Lock()
+
+
+def _ws_norm(path):
+    """工作区相对路径规范化；拒绝绝对路径与 .. 穿越。"""
+    p = str(path or "").replace("\\", "/").strip()
+    if "\x00" in p or len(p) > 4096:
+        raise ValueError("路径不合法")
+    parts = []
+    for seg in p.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            raise ValueError("路径不合法")
+        parts.append(seg)
+    return "/".join(parts)
+
+
+def _ws_entry(client, rel):
+    parent, base = posixpath.split(rel)
+    st, res = client._req("GET", "/api/workspace/list?path=" +
+                          urllib.parse.quote(parent, safe=""))
+    if st == 404:
+        return None
+    if st != 200:
+        raise RuntimeError("读取目录失败（HTTP %s）" % st)
+    for entry in (res or {}).get("entries") or []:
+        if entry.get("name") == base:
+            return entry
+    return None
+
+
+def _ws_collect(client, rel, out, budget, depth=0):
+    """递归收集目录下的文件；超过数量或体积上限直接中止。"""
+    if depth > 16:
+        raise RuntimeError("目录层级过深，已中止")
+    data = client.workspace_list(rel)
+    for entry in data.get("entries") or []:
+        child = _ws_norm(entry.get("path") or "")
+        if not child:
+            continue
+        if entry.get("dir"):
+            _ws_collect(client, child, out, budget, depth + 1)
+            continue
+        budget["files"] += 1
+        budget["bytes"] += int(entry.get("size") or 0)
+        if budget["files"] > _WS_MAX_FILES:
+            raise RuntimeError("文件数量超过 %d 个，请分批下载" % _WS_MAX_FILES)
+        if budget["bytes"] > _WS_MAX_BYTES:
+            raise RuntimeError("总大小超过 1 GB，请分批下载")
+        out.append((child, int(entry.get("size") or 0)))
+
+
+def ws_task_stat(client, task_id):
+    """统计某任务工作目录的文件数与总字节数。"""
+    root = "tasks/" + str(task_id)
+    st, res = client._req("GET", "/api/workspace/list?path=" + root)
+    if st == 404:
+        return {"exists": False, "files": 0, "bytes": 0, "truncated": False}
+    if st != 200:
+        raise RuntimeError("读取任务目录失败（HTTP %s）" % st)
+    out = []
+    budget = {"files": 0, "bytes": 0}
+    try:
+        _ws_collect(client, root, out, budget)
+    except RuntimeError as e:
+        return {"exists": True, "files": budget["files"], "bytes": budget["bytes"],
+                "truncated": True, "warning": str(e)}
+    return {"exists": True, "files": budget["files"], "bytes": budget["bytes"],
+            "truncated": False}
+
+
+def _download_dir():
+    path = os.path.join(tempfile.gettempdir(), "artex-controller-downloads")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _download_cleanup():
+    now = time.time()
+    with _DOWNLOAD_LOCK:
+        for tid, item in list(_DOWNLOAD_TICKETS.items()):
+            if now - item.get("created", 0) <= _DOWNLOAD_TTL:
+                continue
+            _DOWNLOAD_TICKETS.pop(tid, None)
+            try:
+                os.remove(item["path"])
+            except Exception:
+                pass
+
+
+def prepare_workspace_download(client, paths):
+    """把选中的文件/目录准备成本地临时文件，返回 (path, name, size)。"""
+    clean = []
+    for raw in paths or []:
+        p = _ws_norm(raw)
+        if p and p not in clean:
+            clean.append(p)
+    if not clean:
+        raise ValueError("没有选中文件")
+    if len(clean) > 200:
+        raise ValueError("一次最多选择 200 项，请分批下载")
+
+    if len(clean) == 1:
+        entry = _ws_entry(client, clean[0])
+        if entry is None:
+            raise RuntimeError("文件不存在或已被移动")
+        if not entry.get("dir"):
+            fd, tmp = tempfile.mkstemp(prefix="ws-file-", dir=_download_dir())
+            try:
+                with os.fdopen(fd, "wb") as out, client.workspace_stream(clean[0]) as src:
+                    shutil.copyfileobj(src, out, 256 * 1024)
+            except Exception:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                raise
+            name = posixpath.basename(clean[0]) or "download"
+            return tmp, name, os.path.getsize(tmp)
+
+    items, budget = [], {"files": 0, "bytes": 0}
+    for rel in clean:
+        entry = _ws_entry(client, rel)
+        if entry is None:
+            raise RuntimeError("文件不存在或已被移动：%s" % rel)
+        if entry.get("dir"):
+            before = len(items)
+            _ws_collect(client, rel, items, budget)
+            if len(items) == before:
+                items.append((rel.rstrip("/") + "/", 0))
+        else:
+            budget["files"] += 1
+            budget["bytes"] += int(entry.get("size") or 0)
+            if budget["files"] > _WS_MAX_FILES or budget["bytes"] > _WS_MAX_BYTES:
+                raise RuntimeError("文件过多或总大小超过 1 GB，请分批下载")
+            items.append((rel, int(entry.get("size") or 0)))
+
+    fd, tmp = tempfile.mkstemp(prefix="ws-zip-", suffix=".zip", dir=_download_dir())
+    try:
+        with os.fdopen(fd, "wb") as raw, zipfile.ZipFile(raw, "w", zipfile.ZIP_DEFLATED) as zf:
+            for rel, _size in items:
+                if rel.endswith("/"):
+                    zf.writestr(rel, b"")
+                    continue
+                with client.workspace_stream(rel) as src, zf.open(rel, "w") as dst:
+                    shutil.copyfileobj(src, dst, 256 * 1024)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
+    if len(clean) == 1:
+        name = _safe_dirname(posixpath.basename(clean[0]), "files") + ".zip"
+    else:
+        name = "artex-files-%s.zip" % time.strftime("%Y%m%d-%H%M%S")
+    return tmp, name, os.path.getsize(tmp)
+
+
+def drop_task_state(ip, task_id):
+    """任务删除后清掉本地展示顺序与提问记录。"""
+    tid = str(task_id)
+    with _UI_LOCK:
+        state = _ui_state()
+        dirty = False
+        order = (state.get("task_order") or {}).get(ip) or []
+        kept = [x for x in order if str(x) != tid]
+        if len(kept) != len(order):
+            state.setdefault("task_order", {})[ip] = kept
+            dirty = True
+        by_ip = (state.get("ask_history") or {}).get(ip) or {}
+        if by_ip.pop(tid, None) is not None:
+            dirty = True
+        if dirty:
+            try:
+                _ui_flush()
+            except Exception:
+                pass
+
+
 def _latest_seq(client, task_id):
     """取该任务当前最新一条活动的 seq（作为“发消息之前”的游标）。"""
     st, res = client._req("GET", "/api/exploration/activity/history?task=%s&limit=1" % task_id)
@@ -951,6 +1164,18 @@ HTML = r"""<!DOCTYPE html>
   .lnk{color:var(--accent);font-size:11.5px;text-decoration:none;margin-left:8px;cursor:pointer}
   .lnk:hover{text-decoration:underline}
   .auto-row{display:flex;align-items:center}
+  .fold-tri{width:16px;height:16px;padding:0;margin-right:2px;display:inline-flex;align-items:center;
+    justify-content:center;flex:none;background:transparent;border:0;box-shadow:none;color:var(--ink-3)}
+  .fold-tri:hover{background:transparent;color:var(--ink-2)}
+  .fold-tri:active{transform:none}
+  .fold-tri::before{content:'';display:block;border-left:5px solid currentColor;
+    border-top:4px solid transparent;border-bottom:4px solid transparent;transition:transform .15s ease}
+  .fold-tri[aria-expanded="true"]::before{transform:rotate(90deg)}
+  .fold-body{margin:0;padding:8px 10px;border:1px solid var(--line);border-radius:6px;
+    background:var(--panel-2);color:var(--ink-2);font-size:12.5px;line-height:1.6;letter-spacing:.2px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;word-break:break-word}
+  .fold-body.open{white-space:pre-wrap;overflow:auto;text-overflow:clip;max-height:120px}
+  .fold-body:empty{display:none}
   .modal{position:fixed;inset:0;background:rgba(60,48,36,.35);display:flex;
          align-items:center;justify-content:center;z-index:50}
   .modal-box{background:var(--panel);border:1px solid var(--line);border-radius:12px;
@@ -1011,7 +1236,6 @@ HTML = r"""<!DOCTYPE html>
   .row{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:12px}
   .field{display:flex;flex-direction:column;gap:5px}
   .field label{font-size:11px;letter-spacing:.4px;color:var(--ink-3)}
-  .auto{font-size:13px;color:var(--ink-2);padding:7px 0;letter-spacing:.2px}
 
   .chips{display:flex;gap:10px;flex-wrap:wrap;margin:2px 0 18px}
   .chip{
@@ -1206,6 +1430,69 @@ HTML = r"""<!DOCTYPE html>
   .modal-foot{display:flex;align-items:center;gap:10px;margin-top:12px;padding-top:12px;
               border-top:1px solid var(--line-soft)}
   .modal-foot .sp{flex:1}
+
+  /* 服务器文件 */
+  .ws-box{width:min(780px,95vw);padding:18px 20px 16px}
+  .ws-bar{display:flex;align-items:center;gap:8px;margin:4px 0 6px}
+  .ws-bar .icon{height:24px;min-width:27px;padding:0 6px}
+  .ws-path{font-size:11.5px;color:var(--ink-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ws-path b{color:var(--ink);font-weight:500}
+  .ws-path a{color:var(--accent);cursor:pointer;text-decoration:none}
+  .ws-path a:hover{text-decoration:underline}
+  .ws-path .sep{margin:0 5px;color:var(--ink-3)}
+  .ws-quick{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 8px}
+  .ws-chip{font:inherit;font-size:11px;padding:2px 10px;border-radius:12px;border:1px solid var(--line);
+           background:var(--panel-2);color:var(--ink-2);cursor:pointer;box-shadow:none;
+           transition:border-color .12s ease,color .12s ease}
+  .ws-chip:hover{border-color:#d7c2a4;color:var(--ink);background:var(--panel-2)}
+  .ws-chip.on{border-color:var(--accent);color:var(--accent)}
+  .ws-list{max-height:min(54vh,470px);overflow:auto;border:1px solid var(--line-soft);border-radius:8px}
+  .ws-table{width:100%;border-collapse:collapse;table-layout:fixed}
+  .ws-table th{position:sticky;top:0;z-index:1;background:var(--panel-2);
+               font-size:10.5px;letter-spacing:.6px;color:var(--ink-3);font-weight:500;
+               text-align:left;padding:7px 10px;border-bottom:1px solid var(--line)}
+  .ws-table td{padding:6px 10px;font-size:12.5px;border-bottom:1px solid var(--line-soft);white-space:nowrap}
+  .ws-table tbody tr:last-child td{border-bottom:none}
+  .ws-table tbody tr{cursor:pointer}
+  .ws-table tbody tr:hover td{background:rgba(255,255,255,.55)}
+  .ws-table tr.on td{background:#f7efdf}
+  .ws-table tr.on td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
+  .ws-table th.wsc,.ws-table td.wsc{width:30px;padding-right:0;text-align:center}
+  .ws-table .wsize{text-align:right;font-variant-numeric:tabular-nums;color:var(--ink-3);width:92px}
+  .ws-table .wtime{color:var(--ink-3);width:154px}
+  .ws-table .wname{display:flex;align-items:center;gap:8px;min-width:0}
+  .ws-table .wname .nm{overflow:hidden;text-overflow:ellipsis;min-width:0;flex:0 1 auto}
+  .ws-table .wname .sub{color:var(--ink-3);font-size:11px;margin-left:6px;overflow:hidden;text-overflow:ellipsis;flex:none;max-width:45%}
+  .ws-ico{flex:none;width:15px;height:15px;color:var(--ink-3);opacity:.8}
+  .ws-ico.dir{color:var(--accent);opacity:.9}
+  .ws-empty,.ws-loading{padding:26px 0;text-align:center;color:var(--ink-3);font-size:12px}
+  .ws-count{font-variant-numeric:tabular-nums}
+  input[type=checkbox]{accent-color:var(--accent)}
+  .ws-table input[type=checkbox]{width:13px;height:13px;margin:0;vertical-align:-2px}
+
+  /* 危险操作 */
+  button.danger{background:transparent;color:var(--crit);border-color:#e0c3b8;box-shadow:none}
+  button.danger:hover:not(:disabled){background:#fbeeea;color:#963a27}
+  button#del-confirm{background:var(--crit);border-color:#8f3524;color:#fffaf4;
+                     box-shadow:0 1px 2px rgba(120,45,30,.2)}
+  button#del-confirm:hover:not(:disabled){background:#8f3524}
+  .del-box{width:min(560px,94vw)}
+  .del-warn{background:#fbeeea;border:1px solid #eccfc6;color:var(--crit);border-radius:8px;
+            padding:9px 12px;font-size:12px;line-height:1.6;margin-bottom:10px}
+  .del-stat{font-size:12px;color:var(--ink-2);background:var(--panel-2);border:1px solid var(--line-soft);
+            border-radius:7px;padding:7px 11px;margin-bottom:8px;line-height:1.6}
+  .del-opts{display:flex;flex-direction:column;gap:1px;max-height:min(38vh,300px);
+            overflow:auto;margin-bottom:8px}
+  .opt,.ack{display:flex;align-items:flex-start;gap:9px;padding:7px 8px;border-radius:7px;
+            cursor:pointer;transition:background .12s ease}
+  .opt:hover,.ack:hover{background:var(--panel-2)}
+  .opt input,.ack input{margin:3px 0 0;flex:none}
+  .opt b{display:block;font-weight:500;font-size:12.5px;color:var(--ink)}
+  .opt em{display:block;font-style:normal;font-size:11px;color:var(--ink-3);line-height:1.55;margin-top:1px}
+  .opt.all{border:1px dashed var(--line);margin-bottom:4px}
+  .ack{margin:0;border-top:1px solid var(--line-soft);border-radius:0;padding-top:9px}
+  .ack span{font-size:12px;color:var(--ink-2)}
+
   .t-empty{display:flex;flex-direction:column;align-items:center;gap:7px;
            padding:30px 0 26px;color:var(--ink-3);font-size:12px}
   .t-empty svg{opacity:.45}
@@ -1224,6 +1511,16 @@ HTML = r"""<!DOCTYPE html>
   body.dark .trow.on{background:#2f2820;border-color:#4a3c2c}
   body.dark .trow.on .rank{color:#231e18}
   body.dark #tasks tbody tr.sel td{background:#332b22}
+  body.dark .ws-table th{background:#2f2820}
+  body.dark .ws-table tbody tr:hover td{background:rgba(255,255,255,.045)}
+  body.dark .ws-table tr.on td{background:#332b22}
+  body.dark .ws-chip{background:#2f2820}
+  body.dark .ws-chip:hover{border-color:#4a3c2c;background:#2f2820}
+  body.dark .del-warn{background:#3a2620;border-color:#5c352a}
+  body.dark .del-stat{background:#2f2820}
+  body.dark button.danger{color:var(--crit);border-color:#5c352a}
+  body.dark button.danger:hover:not(:disabled){background:#3a2620}
+  body.dark button#del-confirm{background:#b4543d;border-color:#8f3524;color:#231e18}
   body.dark .toast{background:#e6dccc;color:#231e18;box-shadow:0 8px 24px rgba(0,0,0,.45)}
   body.dark .dot.d1:after{border-color:rgba(131,177,142,.5)}
   body.dark .chip{background:var(--panel);
@@ -1291,6 +1588,9 @@ HTML = r"""<!DOCTYPE html>
     body.collapsed .item .ip,body.collapsed .item .lb,body.collapsed .item .ops{display:block}
     #btn-mobile-side{display:block}main{padding:14px 15px 24px}.hdr{margin-bottom:14px}.overview-grid{grid-template-columns:1fr}
     .modal-box{max-height:92vh;overflow:auto}.tasks-box{padding:16px 14px}.trow .tag{display:none}
+    .ws-box,.del-box{width:96vw;padding:15px 14px}
+    .ws-table .wtime,.ws-table th.wtime{display:none}
+    .ws-table .wsize{width:70px}
   }
   @media(max-width:520px){.chips{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.chip{padding:9px 12px}.hdr h1{font-size:14px}
     #p-time{width:100%;order:5}.row{gap:10px}.wordmark{font-size:42px;letter-spacing:10px;text-indent:10px}.trow .tid{display:none}}
@@ -1361,6 +1661,7 @@ HTML = r"""<!DOCTYPE html>
       <div class="hdr">
         <h1 id="p-ip"></h1><span class="muted" id="p-label"></span>
         <span style="flex:1"></span>
+        <button id="btn-files" class="ghost mini" data-i18n="files" data-i18n-title="files_title">文件</button>
         <span class="muted" id="p-time" style="font-size:11.5px"></span>
         <input id="p-pw" type="password" placeholder="SSH 密码" data-i18n-ph="ssh_pw_ph" style="width:150px" hidden>
         <label class="switch" title="连接后自动刷新" data-i18n-title="auto_refresh_title">
@@ -1389,7 +1690,8 @@ HTML = r"""<!DOCTYPE html>
               </svg>
               <span data-i18n="all_tasks">全部任务</span><span class="cnt" id="all-count">0</span>
             </button>
-            <button id="btn-export" class="ghost mini" disabled data-i18n="export">导出报告</button></h3>
+            <button id="btn-export" class="ghost mini" disabled data-i18n="export">导出报告</button>
+            <button id="btn-del-task" class="ghost mini danger" disabled data-i18n="delete_task">删除任务</button></h3>
           <div id="tasks"></div>
           <div id="exp-progress" class="progress" hidden><div id="exp-bar"></div></div>
           <div id="exp-msg" class="muted" style="margin-top:8px;font-size:12px"></div>
@@ -1430,18 +1732,21 @@ HTML = r"""<!DOCTYPE html>
         <!-- 不继承：描述自动 + 目标固定 -->
         <div id="f-auto" style="margin-bottom:10px">
           <div class="field">
-            <label data-i18n="desc_auto">描述（自动生成）</label>
             <div class="auto-row">
-              <div class="auto" id="f-desc-auto"></div>
+              <button type="button" class="fold-tri" id="desc-toggle" aria-expanded="false" aria-controls="f-desc-auto" title="展开 / 收起描述" data-i18n-title="desc_toggle_title"></button>
+              <label data-i18n="desc_auto">描述（自动生成）</label>
               <a class="lnk" id="lnk-desc" title="临时修改本次任务的描述" data-i18n="edit_short" data-i18n-title="edit_desc_title">编辑</a>
             </div>
+            <div class="fold-body" id="f-desc-auto"></div>
             <textarea id="f-desc-tmp" rows="2" hidden placeholder="临时修改本次任务的描述" data-i18n-ph="edit_desc_title"></textarea>
           </div>
           <div class="field" style="margin-top:8px">
             <div class="auto-row">
-              <details><summary><span data-i18n="goal_fixed">目标（默认）</span></summary><pre id="f-goal-fixed"></pre></details>
+              <button type="button" class="fold-tri" id="goal-toggle" aria-expanded="false" aria-controls="f-goal-fixed" title="展开 / 收起目标" data-i18n-title="goal_toggle_title"></button>
+              <label data-i18n="goal_fixed">目标（默认）</label>
               <a class="lnk" id="lnk-goal" title="临时修改本次任务的目标" data-i18n="edit_short" data-i18n-title="edit_goal_title">编辑</a>
             </div>
+            <div class="fold-body" id="f-goal-fixed"></div>
             <textarea id="f-goal-tmp" rows="3" hidden placeholder="临时修改本次任务的目标" data-i18n-ph="edit_goal_title"></textarea>
           </div>
         </div>
@@ -1566,6 +1871,61 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 </div>
+
+<div id="ws-modal" class="modal" hidden>
+  <div class="modal-box ws-box">
+    <div class="modal-head">
+      <div>
+        <h3 data-i18n="ws_title">服务器文件</h3>
+        <div class="modal-sub"><span id="ws-ip"></span> · <span id="ws-sub"></span></div>
+      </div>
+      <button id="ws-close" class="icon" data-i18n-title="close">✕</button>
+    </div>
+    <div class="ws-bar">
+      <button id="ws-up" class="icon" data-i18n-title="ws_up">↑</button>
+      <div id="ws-path" class="ws-path"></div>
+      <span class="sp"></span>
+      <button id="ws-refresh" class="ghost mini" data-i18n="ws_refresh">刷新</button>
+    </div>
+    <div id="ws-quick" class="ws-quick"></div>
+    <div id="ws-list" class="ws-list"></div>
+    <div class="modal-foot">
+      <span id="ws-msg" class="muted"></span>
+      <span class="sp"></span>
+      <span id="ws-count" class="muted"></span>
+      <button id="ws-download" disabled data-i18n="ws_download">下载所选</button>
+    </div>
+  </div>
+</div>
+
+<div id="del-modal" class="modal" hidden>
+  <div class="modal-box del-box">
+    <div class="modal-head">
+      <div>
+        <h3 data-i18n="delete_task">删除任务</h3>
+        <div class="modal-sub" id="del-sub"></div>
+      </div>
+      <button id="del-close" class="icon" data-i18n-title="close">✕</button>
+    </div>
+    <div class="del-warn" data-i18n="del_warn">删除后无法恢复。正在运行的任务会先被中止。</div>
+    <div id="del-stat" class="del-stat"></div>
+    <div class="del-opts">
+      <label class="opt all"><input type="checkbox" id="del-all"><span><b data-i18n="del_all">全部关联数据</b><em data-i18n="del_all_hint">包括资产、流量、文件、漏洞和 LLM 请求/响应记录。</em></span></label>
+      <label class="opt"><input type="checkbox" data-opt="delete_files"><span><b data-i18n="del_files">任务文件</b><em data-i18n="del_files_hint">删除该任务工作目录中的上传文件、命令输出和其他产物。</em></span></label>
+      <label class="opt"><input type="checkbox" data-opt="delete_assets"><span><b data-i18n="del_assets">关联资产</b><em data-i18n="del_assets_hint">删除仅属于该任务的资产；共享资产只解除关联。</em></span></label>
+      <label class="opt"><input type="checkbox" data-opt="delete_traffic"><span><b data-i18n="del_traffic">关联流量</b><em data-i18n="del_traffic_hint">按关联资产的主机名删除；仍被其他任务引用的流量会保留。</em></span></label>
+      <label class="opt"><input type="checkbox" data-opt="delete_findings"><span><b data-i18n="del_findings">关联漏洞</b><em data-i18n="del_findings_hint">永久删除该任务产生的独立漏洞记录与漏洞报告。</em></span></label>
+      <label class="opt"><input type="checkbox" data-opt="delete_llm_records"><span><b data-i18n="del_llm">LLM 记录</b><em data-i18n="del_llm_hint">删除该任务的 LLM 请求与响应记录。</em></span></label>
+    </div>
+    <label class="ack"><input type="checkbox" id="del-ack"><span data-i18n="del_ack">我已知晓该操作不可恢复</span></label>
+    <div class="modal-foot">
+      <span id="del-msg" class="muted"></span>
+      <span class="sp"></span>
+      <button id="del-cancel" class="ghost" data-i18n="cancel">取消</button>
+      <button id="del-confirm" class="danger" disabled data-i18n="del_confirm">确认删除</button>
+    </div>
+  </div>
+</div>
 <div id="toast" class="toast"></div>
 
 <script>
@@ -1610,14 +1970,15 @@ const I18N = {
     ask_empty: '先输入内容', waiting: '等待主 Agent… ', empty_reply: '(空回复)',
     dispatch: '下发任务', name_url: '名称 / 网址', inherit: '继承任务（可选）',
     no_inherit: '不继承 · 用固定模板', duration: '时长（分钟）',
-    desc_auto: '描述（自动生成）', edit_short: '编辑',
+    desc_auto: '描述（自动生成）', desc_toggle_title: '展开 / 收起描述',
+    goal_toggle_title: '展开 / 收起目标', edit_short: '编辑',
     edit_desc_title: '临时修改本次任务的描述', edit_goal_title: '临时修改本次任务的目标',
     goal_fixed: '目标（默认）',
     desc_req: '描述（继承任务时必填）', goal_req: '目标（继承任务时必填）',
     desc_ph: '例如：在 xxx 基础上做二次利用验证', goal_ph: '例如：拿到该后台的管理权限',
     llm: 'LLM', llm_note: '（使用服务器中设定配置）', llm_ph: '（刷新后可选）',
     send_task: '下发', dispatching: '下发中…', confirm_send: '确认下发', cancel: '取消',
-    desc_template: '渗透{1}源站及其子站', name_ph: '<名称>',
+    desc_template: '渗透<名称>源站及其子站',
     read_inherit_fail: '读取继承任务失败', retry_hint: '（重新选一次这个任务即可重试）',
     m_add: '添加机器', m_edit: '编辑机器 · ',
     ip_host: 'IP / 主机名', ssh_port: 'SSH 端口', artex_port: 'ARTEX 端口',
@@ -1652,7 +2013,25 @@ const I18N = {
     question: '问题', answer: '回复', export_report_step: '正在导出总报告…',
     export_critical_step: '正在导出严重漏洞报告…', export_high_step: '正在导出高危漏洞报告…',
     export_finishing: '正在整理导出结果…', export_failed: '导出失败', export_partial: '部分报告失败：{1} 个',
-    export_running: '该任务已有导出正在进行', task_unread: '有新发现', error_details: '详细原因'
+    export_running: '该任务已有导出正在进行', task_unread: '有新发现', error_details: '详细原因',
+    files: '文件', files_title: '浏览并下载服务器工作区文件',
+    ws_title: '服务器文件', ws_up: '上一级', ws_refresh: '刷新', ws_loading: '加载中…',
+    ws_empty: '这个目录是空的', ws_load_failed: '读取目录失败', ws_name: '名称',
+    ws_size: '大小', ws_mtime: '修改时间', ws_root: '工作区', ws_task_link: '任务 #{1}',
+    ws_selected: '已选 {1} 项 · {2}', ws_download: '下载所选', ws_downloading: '打包中…',
+    ws_download_started: '✓ 已开始下载 {1}', ws_download_failed: '下载失败',
+    delete_task: '删除任务', del_warn: '删除后无法恢复。正在运行的任务会先被中止。',
+    del_all: '全部关联数据', del_all_hint: '包括资产、流量、文件、漏洞和 LLM 请求/响应记录。',
+    del_files: '任务文件', del_files_hint: '删除该任务工作目录中的上传文件、命令输出和其他产物。',
+    del_assets: '关联资产', del_assets_hint: '删除仅属于该任务的资产；共享资产只解除关联。',
+    del_traffic: '关联流量', del_traffic_hint: '按关联资产的主机名删除；仍被其他任务引用的流量会保留。',
+    del_findings: '关联漏洞', del_findings_hint: '永久删除该任务产生的独立漏洞记录与漏洞报告。',
+    del_llm: 'LLM 记录', del_llm_hint: '删除该任务的 LLM 请求与响应记录。',
+    del_ack: '我已知晓该操作不可恢复', del_confirm: '确认删除', deleting: '删除中…',
+    del_stat: '任务文件：{1} 个，共 {2}', del_stat_none: '任务文件：无',
+    del_stat_loading: '任务文件：统计中…', del_stat_unknown: '任务文件：无法统计',
+    del_running_warn: '该任务正在运行，删除会先中止它。',
+    del_selected: '已选择 {1} 项关联数据', del_ok: '✓ 任务 #{1} 已删除', del_fail: '删除失败'
   },
   en: {
     sub_local: 'Local only · auto-refresh',
@@ -1687,7 +2066,8 @@ const I18N = {
     ask_empty: 'Enter a message first', waiting: 'Waiting for main Agent… ', empty_reply: '(empty reply)',
     dispatch: 'Dispatch task', name_url: 'Name / URL', inherit: 'Inherit task (optional)',
     no_inherit: "Don't inherit · fixed template", duration: 'Duration (min)',
-    desc_auto: 'Description (auto)', edit_short: 'Edit',
+    desc_auto: 'Description (auto)', desc_toggle_title: 'Expand / collapse description',
+    goal_toggle_title: 'Expand / collapse goal', edit_short: 'Edit',
     edit_desc_title: 'Temporarily override the description for this task',
     edit_goal_title: 'Temporarily override the goal for this task',
     goal_fixed: 'Goal (default)',
@@ -1695,7 +2075,7 @@ const I18N = {
     desc_ph: 'e.g. post-exploitation based on xxx', goal_ph: 'e.g. gain admin access to the panel',
     llm: 'LLM', llm_note: '(configured on the server)', llm_ph: '(available after refresh)',
     send_task: 'Dispatch', dispatching: 'Dispatching…', confirm_send: 'Confirm dispatch', cancel: 'Cancel',
-    desc_template: 'Pentest {1} origin and subdomains', name_ph: '<name>',
+    desc_template: 'Pentest <名称> origin and subdomains',
     read_inherit_fail: 'Failed to load inherited task', retry_hint: ' (reselect the task to retry)',
     m_add: 'Add machine', m_edit: 'Edit machine · ',
     ip_host: 'IP / hostname', ssh_port: 'SSH port', artex_port: 'ARTEX port',
@@ -1730,7 +2110,25 @@ const I18N = {
     question: 'Question', answer: 'Reply', export_report_step: 'Exporting main report…',
     export_critical_step: 'Exporting critical findings…', export_high_step: 'Exporting high findings…',
     export_finishing: 'Finishing export…', export_failed: 'Export failed', export_partial: '{1} report(s) failed',
-    export_running: 'This task already has an export in progress', task_unread: 'New findings', error_details: 'Error details'
+    export_running: 'This task already has an export in progress', task_unread: 'New findings', error_details: 'Error details',
+    files: 'Files', files_title: 'Browse and download files in the server workspace',
+    ws_title: 'Server files', ws_up: 'Up one level', ws_refresh: 'Refresh', ws_loading: 'Loading…',
+    ws_empty: 'This folder is empty', ws_load_failed: 'Failed to read folder', ws_name: 'Name',
+    ws_size: 'Size', ws_mtime: 'Modified', ws_root: 'Workspace', ws_task_link: 'Task #{1}',
+    ws_selected: '{1} selected · {2}', ws_download: 'Download selected', ws_downloading: 'Packaging…',
+    ws_download_started: '✓ Download started: {1}', ws_download_failed: 'Download failed',
+    delete_task: 'Delete task', del_warn: 'This cannot be undone. A running task will be aborted first.',
+    del_all: 'All related data', del_all_hint: 'Assets, traffic, files, findings and LLM request/response records.',
+    del_files: 'Task files', del_files_hint: 'Uploads, command output and other artifacts in the task workspace.',
+    del_assets: 'Related assets', del_assets_hint: 'Deletes assets owned only by this task; shared assets are detached.',
+    del_traffic: 'Related traffic', del_traffic_hint: 'Deletes by exact host; traffic still referenced elsewhere is kept.',
+    del_findings: 'Related findings', del_findings_hint: 'Permanently deletes this task’s standalone findings and reports.',
+    del_llm: 'LLM records', del_llm_hint: 'Deletes this task’s LLM request and response records.',
+    del_ack: 'I understand this action is irreversible', del_confirm: 'Delete permanently', deleting: 'Deleting…',
+    del_stat: 'Task files: {1} file(s), {2}', del_stat_none: 'Task files: none',
+    del_stat_loading: 'Task files: calculating…', del_stat_unknown: 'Task files: unavailable',
+    del_running_warn: 'This task is running; deleting it will abort it first.',
+    del_selected: '{1} related data option(s) selected', del_ok: '✓ Task #{1} deleted', del_fail: 'Delete failed'
   }
 };
 function T(k, ...args){
@@ -2035,7 +2433,12 @@ function select(ip){
   $('f-src').value = '';
   $('ask-sec').hidden = true;
   ASK = null;
+  $('f-desc-tmp').value = ''; $('f-goal-tmp').value = '';
+  setEditOpen('f-desc-auto', 'f-desc-tmp', false);
+  setEditOpen('f-goal-fixed', 'f-goal-tmp', false);
   updateDesc();
+  setDescOpen(false);
+  setGoalOpen(false);
   const conn = !!CONNECTED[ip];
   $('p-state-title').textContent = RECONNECT[ip] ? T('reconnecting') : T('empty_title');
   $('p-state-sub').textContent = RECONNECT[ip] ? (RECONNECT[ip].error || '') : T('empty_hint');
@@ -2050,16 +2453,32 @@ function select(ip){
   }
   renderMachines(); animateView($('panel')); setMobileSide(false);
 }
-function updateDesc(){
-  const v = $('f-name').value.trim();
-  $('f-desc-auto').textContent = T('desc_template', v || T('name_ph'));
+function fillDescTemplate(name){
+  const tpl = CFG.desc_template || T('desc_template');
+  return name ? tpl.split('<名称>').join(name) : tpl;
 }
+function updateDesc(){
+  $('f-desc-auto').textContent = fillDescTemplate($('f-name').value.trim());
+}
+function setFoldOpen(triId, bodyId, open){
+  $(triId).setAttribute('aria-expanded', open ? 'true' : 'false');
+  $(bodyId).classList.toggle('open', open);
+}
+function setDescOpen(open){ setFoldOpen('desc-toggle', 'f-desc-auto', open); }
+function setGoalOpen(open){ setFoldOpen('goal-toggle', 'f-goal-fixed', open); }
+$('desc-toggle').onclick = () => setDescOpen($('desc-toggle').getAttribute('aria-expanded') !== 'true');
+$('goal-toggle').onclick = () => setGoalOpen($('goal-toggle').getAttribute('aria-expanded') !== 'true');
 
 /* 继承任务：切换后描述/目标改为手填 */
 async function onSrcChange(){
   const src = $('f-src').value;
   $('f-auto').hidden = !!src;
   $('f-manual').hidden = !src;
+  if (src){
+    $('f-desc-tmp').value = ''; $('f-goal-tmp').value = '';
+    setEditOpen('f-desc-auto', 'f-desc-tmp', false);
+    setEditOpen('f-goal-fixed', 'f-goal-tmp', false);
+  }
   $('f-msg').textContent = '';
   if (!src) return;
   if (!CUR) return;
@@ -2084,17 +2503,33 @@ async function onSrcChange(){
 $('f-src').addEventListener('change', onSrcChange);
 $('f-name').addEventListener('input', updateDesc);
 
+function setEditOpen(boxId, tmpId, open){
+  $(boxId).hidden = open;
+  $(tmpId).hidden = !open;
+}
 $('lnk-desc').onclick = (e) => {
   e.preventDefault();
   const t = $('f-desc-tmp');
-  if (t.hidden){ t.value = $('f-desc-auto').textContent || ''; t.hidden = false; t.focus(); }
-  else { t.hidden = true; }
+  if (t.hidden){
+    setDescOpen(false);
+    t.value = $('f-desc-auto').textContent || '';
+    setEditOpen('f-desc-auto', 'f-desc-tmp', true);
+    t.focus();
+  } else {
+    setEditOpen('f-desc-auto', 'f-desc-tmp', false);
+  }
 };
 $('lnk-goal').onclick = (e) => {
   e.preventDefault();
   const t = $('f-goal-tmp');
-  if (t.hidden){ t.value = $('f-goal-fixed').dataset.raw || CFG.goal || ''; t.hidden = false; t.focus(); }
-  else { t.hidden = true; }
+  if (t.hidden){
+    setGoalOpen(false);
+    t.value = $('f-goal-fixed').dataset.raw || CFG.goal || '';
+    setEditOpen('f-goal-fixed', 'f-goal-tmp', true);
+    t.focus();
+  } else {
+    setEditOpen('f-goal-fixed', 'f-goal-tmp', false);
+  }
 };
 
 function setDot(ip, cls){ const d = $('dot-' + ip); if (d) d.className = 'dot ' + cls; }
@@ -2344,6 +2779,7 @@ function render(d){
     : '<div class="empty-table">' + esc(T('no_tasks')) + '</div>';
   if (SEL && !list.some(t => String(t.id) === SEL.id)) SEL = null;
   $('btn-export').disabled = !SEL || !!(SEL && EXPORTING[CUR + ':' + SEL.id]);
+  $('btn-del-task').disabled = !SEL;
 
   const srcSel = $('f-src');
   const keep = srcSel.value;
@@ -2367,6 +2803,7 @@ function render(d){
       tr.querySelector('.task-unread')?.remove();
       const exportKey = CUR + ':' + SEL.id;
       $('btn-export').disabled = !!EXPORTING[exportKey];
+      $('btn-del-task').disabled = false;
       if (!EXPORTING[exportKey]){
         $('exp-progress').hidden = true;
         if (EXPORT_RESULTS[exportKey]) showExportResult(EXPORT_RESULTS[exportKey]);
@@ -2408,7 +2845,7 @@ function askSend(){
   const mins = $('f-timeout').value || 600;
   const tmpDesc = (!$('f-desc-tmp').hidden && $('f-desc-tmp').value.trim());
   const desc = src ? $('f-desc').value.trim()
-                   : (tmpDesc || T('desc_template', name));
+                   : (tmpDesc || fillDescTemplate(name));
   const goalTxt = src ? $('f-goal').value.trim() : '';
   let extra = '';
   if (src){
@@ -2459,11 +2896,14 @@ async function send(){
     if (d.ok){
       $('f-msg').innerHTML = '<span class="ok">' + esc(T('dispatched', d.task_id, d.status)) + '</span>';
       $('f-name').value = '';
-      $('f-desc-tmp').hidden = true; $('f-desc-tmp').value = '';
-      $('f-goal-tmp').hidden = true; $('f-goal-tmp').value = '';
+      $('f-desc-tmp').value = ''; $('f-goal-tmp').value = '';
+      setEditOpen('f-desc-auto', 'f-desc-tmp', false);
+      setEditOpen('f-goal-fixed', 'f-goal-tmp', false);
       $('f-src').value = '';
       onSrcChange();
       updateDesc();
+      setDescOpen(false);
+      setGoalOpen(false);
       await pollOnce();
     } else {
       $('f-msg').innerHTML = '<span style="color:#a8452f">✗ ' + esc(d.error || T('dispatch_failed')) + '</span>';
@@ -2686,6 +3126,336 @@ async function doExport(){
   }
 }
 $('btn-export').onclick = doExport;
+
+/* ---------- 服务器文件 ---------- */
+let WS = {ip: null, path: '', entries: [], sel: new Set(), loading: false, busy: false};
+let WS_REQ = 0;
+const DEL_OPTS = ['delete_files', 'delete_assets', 'delete_traffic', 'delete_findings', 'delete_llm_records'];
+let DEL = {ip: null, task_id: null, name: '', running: false, error: ''};
+
+const WS_DIR_ICO = '<svg class="ws-ico dir" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M1.6 3.9c0-.6.5-1.1 1.1-1.1h3.1l1.4 1.6h6.1c.6 0 1.1.5 1.1 1.1v6.6c0 .6-.5 1.1-1.1 1.1H2.7c-.6 0-1.1-.5-1.1-1.1z"/></svg>';
+const WS_FILE_ICO = '<svg class="ws-ico" viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.1" d="M3.9 1.8h5l3.7 3.7v8.7H3.9z"/><path fill="none" stroke="currentColor" stroke-width="1.1" d="M8.8 1.9v3.7h3.6"/></svg>';
+
+function fmtSize(n){
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+  return (n >= 100 ? Math.round(n) : n.toFixed(n >= 10 ? 1 : 2)) + ' ' + units[i];
+}
+function fmtTime(ts){
+  const d = new Date((Number(ts) || 0) * 1000);
+  if (!ts || isNaN(d.getTime())) return '—';
+  const p = x => String(x).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+    p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function pwFor(ip){
+  const m = MACHINES.find(x => x.ip === ip);
+  return (m && (m.has_password || m.has_key)) ? '' : $('p-pw').value;
+}
+function wsTaskIndex(){
+  const d = REFRESHED[WS.ip] || {};
+  const out = {};
+  (d.all_tasks || []).forEach(t => { out[String(t.id)] = t; });
+  return out;
+}
+
+function openFiles(path){
+  if (!CUR) return;
+  WS.ip = CUR; WS.sel.clear(); WS.busy = false;
+  $('ws-msg').textContent = '';
+  openModal($('ws-modal'));
+  loadWs(path || '');
+}
+
+async function loadWs(path){
+  if (!WS.ip) return;
+  const req = ++WS_REQ;
+  WS.loading = true; WS.sel.clear();
+  $('ws-msg').textContent = '';
+  $('ws-list').innerHTML = '<div class="ws-loading">' + esc(T('ws_loading')) + '</div>';
+  updateWsSel();
+  try {
+    const d = await api('/api/ws/list', {ip: WS.ip, password: pwFor(WS.ip), path: path || ''});
+    if (req !== WS_REQ) return;
+    WS.loading = false;
+    if (!d.ok){
+      $('ws-msg').innerHTML = '<span style="color:var(--crit)">' + esc(d.error || T('ws_load_failed')) + '</span>';
+      $('ws-list').innerHTML = '';
+      renderWs();
+      return;
+    }
+    WS.path = d.path || '';
+    WS.entries = d.entries || [];
+    renderWs();
+  } catch(e){
+    if (req !== WS_REQ) return;
+    WS.loading = false;
+    $('ws-msg').innerHTML = '<span style="color:var(--crit)">' + esc(T('req_failed') + e) + '</span>';
+    $('ws-list').innerHTML = '';
+    renderWs();
+  }
+}
+
+function renderWs(){
+  $('ws-ip').textContent = WS.ip || '';
+  $('ws-sub').textContent = WS.path ? ('/' + WS.path) : '/';
+  const parts = WS.path ? WS.path.split('/') : [];
+  let crumb = '<a data-ws-go="">' + esc(T('ws_root')) + '</a>';
+  const acc = [];
+  parts.forEach((p, i) => {
+    acc.push(p);
+    crumb += '<span class="sep">/</span>' + (i === parts.length - 1
+      ? '<b>' + esc(p) + '</b>'
+      : '<a data-ws-go="' + esc(acc.join('/')) + '">' + esc(p) + '</a>');
+  });
+  $('ws-path').innerHTML = crumb;
+  $('ws-path').querySelectorAll('a[data-ws-go]').forEach(a => {
+    a.onclick = () => loadWs(a.dataset.wsGo);
+  });
+  $('ws-up').disabled = !WS.path;
+
+  const chips = [{p: '', label: T('ws_root')}, {p: 'tasks', label: 'tasks'}];
+  if (SEL && CUR === WS.ip) chips.push({p: 'tasks/' + SEL.id, label: T('ws_task_link', SEL.id)});
+  $('ws-quick').innerHTML = chips.map(c =>
+    '<button class="ws-chip' + (WS.path === c.p ? ' on' : '') + '" data-ws-go="' + esc(c.p) + '">' +
+    esc(c.label) + '</button>').join('');
+  $('ws-quick').querySelectorAll('button[data-ws-go]').forEach(b => {
+    b.onclick = () => loadWs(b.dataset.wsGo);
+  });
+
+  if (WS.loading){ updateWsSel(); return; }
+  if (!WS.entries.length){
+    $('ws-list').innerHTML = '<div class="ws-empty">' + esc(T('ws_empty')) + '</div>';
+    updateWsSel();
+    return;
+  }
+
+  const tasks = WS.path === 'tasks' ? wsTaskIndex() : null;
+  const rows = WS.entries.map((e, i) => {
+    const checked = WS.sel.has(e.path);
+    let sub = '';
+    if (tasks && e.dir && /^\d+$/.test(e.name) && tasks[e.name])
+      sub = '<span class="sub">' + esc(tasks[e.name].name) + '</span>';
+    return '<tr data-i="' + i + '"' + (checked ? ' class="on"' : '') + '>' +
+      '<td class="wsc"><input type="checkbox" data-ws-sel="' + esc(e.path) + '"' + (checked ? ' checked' : '') + '></td>' +
+      '<td><div class="wname">' + (e.dir ? WS_DIR_ICO : WS_FILE_ICO) +
+        '<span class="nm" title="' + esc(e.name) + '">' + esc(e.name) + '</span>' + sub + '</div></td>' +
+      '<td class="wsize">' + (e.dir ? '—' : esc(fmtSize(e.size))) + '</td>' +
+      '<td class="wtime">' + esc(fmtTime(e.mtime)) + '</td></tr>';
+  }).join('');
+  $('ws-list').innerHTML = '<table class="ws-table"><thead><tr>' +
+    '<th class="wsc"><input type="checkbox" id="ws-all"></th>' +
+    '<th>' + esc(T('ws_name')) + '</th><th class="wsize">' + esc(T('ws_size')) + '</th>' +
+    '<th class="wtime">' + esc(T('ws_mtime')) + '</th></tr></thead><tbody>' + rows + '</tbody></table>';
+
+  $('ws-list').querySelectorAll('tbody tr[data-i]').forEach(tr => {
+    const entry = WS.entries[Number(tr.dataset.i)];
+    if (!entry) return;
+    tr.onclick = (ev) => {
+      if (ev.target.closest('input[type=checkbox]')) return;
+      if (entry.dir) loadWs(entry.path);
+      else toggleWsSel(entry.path);
+    };
+    const cb = tr.querySelector('input[data-ws-sel]');
+    if (cb){
+      cb.onclick = ev => ev.stopPropagation();
+      cb.onchange = () => toggleWsSel(entry.path, cb.checked);
+    }
+  });
+  const all = $('ws-all');
+  if (all){
+    all.onclick = ev => ev.stopPropagation();
+    all.onchange = () => {
+      if (all.checked) WS.entries.forEach(e => WS.sel.add(e.path));
+      else WS.sel.clear();
+      $('ws-list').querySelectorAll('input[data-ws-sel]').forEach(cb => {
+        cb.checked = all.checked;
+        const tr = cb.closest('tr'); if (tr) tr.classList.toggle('on', all.checked);
+      });
+      updateWsSel();
+    };
+  }
+  updateWsSel();
+}
+
+function toggleWsSel(path, force){
+  if (typeof force === 'boolean'){
+    if (force) WS.sel.add(path); else WS.sel.delete(path);
+  } else if (WS.sel.has(path)) WS.sel.delete(path);
+  else WS.sel.add(path);
+  $('ws-list').querySelectorAll('input[data-ws-sel]').forEach(cb => {
+    if (cb.dataset.wsSel !== path) return;
+    cb.checked = WS.sel.has(path);
+    const tr = cb.closest('tr'); if (tr) tr.classList.toggle('on', cb.checked);
+  });
+  updateWsSel();
+}
+
+function updateWsSel(){
+  const n = WS.sel.size;
+  let bytes = 0;
+  WS.entries.forEach(e => { if (WS.sel.has(e.path) && !e.dir) bytes += Number(e.size) || 0; });
+  $('ws-count').textContent = n ? T('ws_selected', n, fmtSize(bytes)) : '';
+  $('ws-download').disabled = !n || WS.loading || WS.busy;
+  const all = $('ws-all');
+  if (all){
+    const total = WS.entries.length;
+    all.checked = total > 0 && n === total;
+    all.indeterminate = n > 0 && n < total;
+  }
+}
+
+async function downloadSelected(){
+  if (!WS.ip || WS.busy || !WS.sel.size) return;
+  const paths = [...WS.sel];
+  WS.busy = true;
+  $('ws-msg').textContent = '';
+  $('ws-download').disabled = true;
+  $('ws-download').textContent = T('ws_downloading');
+  try {
+    const d = await api('/api/ws/download', {ip: WS.ip, password: pwFor(WS.ip), paths});
+    if (!d.ok) throw new Error(d.error || T('ws_download_failed'));
+    const a = document.createElement('a');
+    a.href = '/api/ws/download?id=' + encodeURIComponent(d.id);
+    a.download = d.name || '';
+    document.body.appendChild(a); a.click(); a.remove();
+    toast(T('ws_download_started', d.name || ''));
+  } catch(e){
+    $('ws-msg').innerHTML = '<span style="color:var(--crit)">' + esc(T('ws_download_failed') + ': ' + (e.message || e)) + '</span>';
+  } finally {
+    WS.busy = false;
+    $('ws-download').textContent = T('ws_download');
+    updateWsSel();
+  }
+}
+
+function closeFiles(){
+  closeModal($('ws-modal'));
+}
+
+/* ---------- 删除任务 ---------- */
+function delOptions(){
+  const out = {};
+  DEL_OPTS.forEach(k => {
+    const cb = document.querySelector('#del-modal input[data-opt="' + k + '"]');
+    out[k] = !!(cb && cb.checked);
+  });
+  return out;
+}
+
+function syncDelOpts(){
+  const boxes = [...document.querySelectorAll('#del-modal input[data-opt]')];
+  const n = boxes.filter(b => b.checked).length;
+  const all = $('del-all');
+  all.checked = n === boxes.length;
+  all.indeterminate = n > 0 && n < boxes.length;
+  $('del-ack').disabled = DEL.running;
+  $('del-confirm').disabled = DEL.running || !$('del-ack').checked;
+  if (!DEL.running && !DEL.error) $('del-msg').textContent = n ? T('del_selected', n) : '';
+}
+
+function openDelete(){
+  if (!CUR || !SEL) return;
+  DEL = {ip: CUR, task_id: String(SEL.id), name: SEL.name || '', running: false, error: ''};
+  $('del-sub').textContent = '#' + DEL.task_id + ' · ' + DEL.name + ' · ' + DEL.ip;
+  $('del-msg').textContent = '';
+  document.querySelectorAll('#del-modal input[data-opt]').forEach(cb => { cb.checked = false; cb.disabled = false; });
+  $('del-all').disabled = false; $('del-all').indeterminate = false;
+  $('del-ack').checked = false; $('del-ack').disabled = false;
+  $('del-close').disabled = false; $('del-cancel').disabled = false;
+  $('del-confirm').textContent = T('del_confirm');
+  $('del-stat').textContent = T('del_stat_loading');
+  syncDelOpts();
+  openModal($('del-modal'));
+  loadDelStat();
+}
+
+async function loadDelStat(){
+  const ip = DEL.ip, tid = DEL.task_id;
+  if (!ip || !tid) return;
+  try {
+    const d = await api('/api/ws/stat', {ip, password: pwFor(ip), task_id: tid});
+    if (DEL.task_id !== tid || DEL.ip !== ip) return;
+    let line;
+    if (!d.ok) line = T('del_stat_unknown');
+    else if (!d.exists) line = T('del_stat_none');
+    else line = T('del_stat', d.files, fmtSize(d.bytes)) + (d.truncated ? ' …' : '');
+    const t = ((REFRESHED[ip] || {}).all_tasks || []).find(x => String(x.id) === tid);
+    if (t && ['running', 'queued', 'created'].includes(t.status)) line += ' ' + T('del_running_warn');
+    $('del-stat').textContent = line;
+  } catch(e){
+    if (DEL.task_id === tid) $('del-stat').textContent = T('del_stat_unknown');
+  }
+}
+
+function closeDelete(){
+  if (DEL.running) return;
+  closeModal($('del-modal'));
+}
+
+async function doDeleteTask(){
+  if (!DEL.ip || !DEL.task_id || DEL.running || !$('del-ack').checked) return;
+  const opts = delOptions(), ip = DEL.ip, tid = DEL.task_id;
+  DEL.running = true; DEL.error = '';
+  $('del-confirm').disabled = true; $('del-confirm').textContent = T('deleting');
+  $('del-close').disabled = true; $('del-cancel').disabled = true;
+  document.querySelectorAll('#del-modal input[data-opt]').forEach(cb => { cb.disabled = true; });
+  $('del-all').disabled = true; $('del-ack').disabled = true;
+  $('del-msg').innerHTML = '<span class="muted">' + esc(T('deleting')) + '</span>';
+  try {
+    const d = await api('/api/task-delete', Object.assign({ip, password: pwFor(ip), task_id: tid}, opts));
+    if (!d.ok) throw new Error(d.error || T('del_fail'));
+    closeModal($('del-modal'));
+    toast(T('del_ok', tid));
+    if (SEL && SEL.id === tid) SEL = null;
+    if (ASK && ASK.id === tid){ ASK = null; $('ask-sec').hidden = true; }
+    if (TASK_UNREAD[ip]) delete TASK_UNREAD[ip][tid];
+    if (REFRESHED[ip] && Array.isArray(REFRESHED[ip].all_tasks)){
+      REFRESHED[ip].all_tasks = REFRESHED[ip].all_tasks.filter(t => String(t.id) !== tid);
+      if (REFRESHED[ip].tasks_total) REFRESHED[ip].tasks_total = Math.max(0, REFRESHED[ip].tasks_total - 1);
+    }
+    if (CUR === ip && REFRESHED[ip]) render(REFRESHED[ip]);
+    pollOnce();
+  } catch(e){
+    DEL.error = e.message || String(e);
+    $('del-msg').innerHTML = '<span style="color:var(--crit)">' + esc(DEL.error) + '</span>';
+  } finally {
+    DEL.running = false;
+    $('del-confirm').textContent = T('del_confirm');
+    $('del-close').disabled = false; $('del-cancel').disabled = false;
+    document.querySelectorAll('#del-modal input[data-opt]').forEach(cb => { cb.disabled = false; });
+    $('del-all').disabled = false; $('del-ack').disabled = false;
+    syncDelOpts();
+  }
+}
+
+$('btn-files').onclick = () => openFiles('');
+$('ws-close').onclick = closeFiles;
+$('ws-up').onclick = () => {
+  if (!WS.path) return;
+  loadWs(WS.path.split('/').slice(0, -1).join('/'));
+};
+$('ws-refresh').onclick = () => loadWs(WS.path);
+$('ws-download').onclick = downloadSelected;
+$('ws-modal').addEventListener('mousedown', e => { if (e.target === $('ws-modal')) closeFiles(); });
+
+$('btn-del-task').onclick = openDelete;
+$('del-close').onclick = closeDelete;
+$('del-cancel').onclick = closeDelete;
+$('del-modal').addEventListener('mousedown', e => { if (e.target === $('del-modal')) closeDelete(); });
+$('del-all').onchange = () => {
+  document.querySelectorAll('#del-modal input[data-opt]').forEach(cb => { cb.checked = $('del-all').checked; });
+  DEL.error = ''; syncDelOpts();
+};
+document.querySelectorAll('#del-modal input[data-opt]').forEach(cb => {
+  cb.onchange = () => { DEL.error = ''; syncDelOpts(); };
+});
+$('del-ack').onchange = () => { DEL.error = ''; syncDelOpts(); };
+$('del-confirm').onclick = doDeleteTask;
+
 $('btn-send').onclick = askSend;
 $('btn-confirm-send').onclick = () => { $('f-confirm').hidden = true; $('btn-send').disabled = false; send(); };
 $('btn-cancel-send').onclick = cancelSend;
@@ -2847,6 +3617,8 @@ document.addEventListener('pointerdown', e => {
 
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
+  if (!$('ws-modal').hidden){ closeFiles(); return; }
+  if (!$('del-modal').hidden){ closeDelete(); return; }
   if (!$('t-modal').hidden){ closeTasks(); return; }
   if (!$('m-modal').hidden){ closeModal($('m-modal')); return; }
   if (document.body.classList.contains('mobile-side')){ setMobileSide(false); return; }
@@ -2947,6 +3719,9 @@ SETTINGS_HTML = r"""<!DOCTYPE html>
     <div class="row"><label class="check"><input id="coverage_enabled" type="checkbox"><span data-i18n="coverage">启用覆盖检查</span></label>
       <label class="check"><input id="seed_first_intent" type="checkbox"><span data-i18n="seed">生成首个意图</span></label></div>
     <div class="field"><label data-i18n="goal">固定目标模板</label><textarea id="goal" rows="5"></textarea></div>
+    <div class="field" style="margin-top:10px"><label data-i18n="desc_template">任务描述模板</label>
+      <textarea id="desc_template" rows="2" data-i18n-ph="desc_template_ph" placeholder="渗透&lt;名称&gt;源站及其子站"></textarea>
+      <div class="hint" data-i18n="desc_template_hint">不继承任务时自动生成描述，&lt;名称&gt; 会替换为「名称 / 网址」</div></div>
   </section>
   <section class="card"><h2 data-i18n="connection">连接与安全</h2><div class="hint" data-i18n="conn_sub">机器单独填写的端口和账号优先于这里的默认值</div>
     <div class="row"><div class="field"><label data-i18n="artex_port">ARTEX 默认端口</label><input id="default_artex_port" type="number" min="1" max="65535"></div>
@@ -2976,8 +3751,8 @@ SETTINGS_HTML = r"""<!DOCTYPE html>
 <script>
 let LANG='zh', SETTINGS={};
 const D={
- zh:{sub:'全局设置',back:'← 返回控制台',ui:'界面与刷新',ui_sub:'控制默认外观、自动连接和轮询频率',lang:'语言',theme:'默认主题',light:'浅色',dark:'深色',refresh:'前台刷新间隔（秒）',background_refresh:'后台刷新间隔（秒）',auto_connect:'启动后自动连接已保存凭据的机器',notifications:'后台出现新严重 / 高危漏洞时发送系统通知',task_defaults:'任务默认值',task_sub:'新任务将使用这些参数，单台下发时仍可临时修改',timeout:'默认时长（分钟）',heartbeat:'计划心跳（分钟）',llm_ph:'服务器默认',test_prefix:'测试任务前缀',coverage:'启用覆盖检查',seed:'生成首个意图',goal:'固定目标模板',connection:'连接与安全',conn_sub:'机器单独填写的端口和账号优先于这里的默认值',artex_port:'ARTEX 默认端口',ssh_timeout:'SSH 超时（秒）',reconnect_seconds:'重连基础间隔（秒）',login_user:'ARTEX 默认账号',login_password:'ARTEX 默认密码',auto_reconnect:'连接中断后自动重连（指数退避）',plaintext:'密码以明文保存在本机 config.toml，请控制文件权限且不要提交到仓库。',data:'数据与维护',data_sub:'管理报告位置、配置备份、任务顺序和受信任主机密钥',export_dir:'报告导出目录（相对于程序目录）',open_config:'打开配置目录',open_export:'打开报告目录',backup:'立即备份配置',reset_order:'重置任务展示顺序',reset:'重置',host_keys:'已信任主机密钥',local_only:'仅本机访问',save:'保存设置',saving:'保存中…',saved:'设置已保存',fail:'保存失败',req_fail:'请求失败：',no_keys:'尚未记录主机密钥，首次 SSH 连接后会显示在这里。',no_machines:'没有可重置的机器',delete_key:'删除',delete_confirm:'确认删除 {1} 的受信任密钥？下次连接会重新记录，请确认目标主机可信。',reset_confirm:'确认重置 {1} 的任务顺序？',done:'操作完成',backup_exists:'已有 config.toml.bak'},
- en:{sub:'Settings',back:'← Back to console',ui:'Interface & refresh',ui_sub:'Default appearance, startup connections and polling frequency',lang:'Language',theme:'Default theme',light:'Light',dark:'Dark',refresh:'Foreground refresh interval (sec)',background_refresh:'Background refresh interval (sec)',auto_connect:'Connect machines with saved credentials at startup',notifications:'Send system notifications for new critical/high findings in background',task_defaults:'Task defaults',task_sub:'Used for new tasks; individual dispatches can still override them',timeout:'Default duration (min)',heartbeat:'Plan heartbeat (min)',llm_ph:'Server default',test_prefix:'Test task prefix',coverage:'Enable coverage checks',seed:'Generate first intent',goal:'Fixed goal template',connection:'Connection & security',conn_sub:'Per-machine ports and credentials override these defaults',artex_port:'Default ARTEX port',ssh_timeout:'SSH timeout (sec)',reconnect_seconds:'Reconnect base delay (sec)',login_user:'Default ARTEX user',login_password:'Default ARTEX password',auto_reconnect:'Reconnect automatically after connection loss (exponential backoff)',plaintext:'Passwords are stored in plaintext in local config.toml. Protect the file and never commit it.',data:'Data & maintenance',data_sub:'Manage reports, configuration backups, task order and trusted host keys',export_dir:'Report export directory (relative to app)',open_config:'Open config folder',open_export:'Open report folder',backup:'Back up config now',reset_order:'Reset task display order',reset:'Reset',host_keys:'Trusted host keys',local_only:'local access only',save:'Save settings',saving:'Saving…',saved:'Settings saved',fail:'Save failed',req_fail:'Request failed: ',no_keys:'No host keys yet. They appear after the first SSH connection.',no_machines:'No machines to reset',delete_key:'Delete',delete_confirm:'Delete the trusted key for {1}? The next connection will trust a new key; verify the host first.',reset_confirm:'Reset task order for {1}?',done:'Done',backup_exists:'config.toml.bak exists'}
+ zh:{sub:'全局设置',back:'← 返回控制台',ui:'界面与刷新',ui_sub:'控制默认外观、自动连接和轮询频率',lang:'语言',theme:'默认主题',light:'浅色',dark:'深色',refresh:'前台刷新间隔（秒）',background_refresh:'后台刷新间隔（秒）',auto_connect:'启动后自动连接已保存凭据的机器',notifications:'后台出现新严重 / 高危漏洞时发送系统通知',task_defaults:'任务默认值',task_sub:'新任务将使用这些参数，单台下发时仍可临时修改',timeout:'默认时长（分钟）',heartbeat:'计划心跳（分钟）',llm_ph:'服务器默认',test_prefix:'测试任务前缀',coverage:'启用覆盖检查',seed:'生成首个意图',goal:'固定目标模板',desc_template:'任务描述模板',desc_template_ph:'例如：渗透<名称>源站及其子站',desc_template_hint:'不继承任务时自动生成描述，<名称> 会替换为「名称 / 网址」',connection:'连接与安全',conn_sub:'机器单独填写的端口和账号优先于这里的默认值',artex_port:'ARTEX 默认端口',ssh_timeout:'SSH 超时（秒）',reconnect_seconds:'重连基础间隔（秒）',login_user:'ARTEX 默认账号',login_password:'ARTEX 默认密码',auto_reconnect:'连接中断后自动重连（指数退避）',plaintext:'密码以明文保存在本机 config.toml，请控制文件权限且不要提交到仓库。',data:'数据与维护',data_sub:'管理报告位置、配置备份、任务顺序和受信任主机密钥',export_dir:'报告导出目录（相对于程序目录）',open_config:'打开配置目录',open_export:'打开报告目录',backup:'立即备份配置',reset_order:'重置任务展示顺序',reset:'重置',host_keys:'已信任主机密钥',local_only:'仅本机访问',save:'保存设置',saving:'保存中…',saved:'设置已保存',fail:'保存失败',req_fail:'请求失败：',no_keys:'尚未记录主机密钥，首次 SSH 连接后会显示在这里。',no_machines:'没有可重置的机器',delete_key:'删除',delete_confirm:'确认删除 {1} 的受信任密钥？下次连接会重新记录，请确认目标主机可信。',reset_confirm:'确认重置 {1} 的任务顺序？',done:'操作完成',backup_exists:'已有 config.toml.bak'},
+ en:{sub:'Settings',back:'← Back to console',ui:'Interface & refresh',ui_sub:'Default appearance, startup connections and polling frequency',lang:'Language',theme:'Default theme',light:'Light',dark:'Dark',refresh:'Foreground refresh interval (sec)',background_refresh:'Background refresh interval (sec)',auto_connect:'Connect machines with saved credentials at startup',notifications:'Send system notifications for new critical/high findings in background',task_defaults:'Task defaults',task_sub:'Used for new tasks; individual dispatches can still override them',timeout:'Default duration (min)',heartbeat:'Plan heartbeat (min)',llm_ph:'Server default',test_prefix:'Test task prefix',coverage:'Enable coverage checks',seed:'Generate first intent',goal:'Fixed goal template',desc_template:'Task description template',desc_template_ph:'e.g. Pentest <名称> origin and subdomains',desc_template_hint:'Used for new tasks; <名称> is replaced with the name / URL',connection:'Connection & security',conn_sub:'Per-machine ports and credentials override these defaults',artex_port:'Default ARTEX port',ssh_timeout:'SSH timeout (sec)',reconnect_seconds:'Reconnect base delay (sec)',login_user:'Default ARTEX user',login_password:'Default ARTEX password',auto_reconnect:'Reconnect automatically after connection loss (exponential backoff)',plaintext:'Passwords are stored in plaintext in local config.toml. Protect the file and never commit it.',data:'Data & maintenance',data_sub:'Manage reports, configuration backups, task order and trusted host keys',export_dir:'Report export directory (relative to app)',open_config:'Open config folder',open_export:'Open report folder',backup:'Back up config now',reset_order:'Reset task display order',reset:'Reset',host_keys:'Trusted host keys',local_only:'local access only',save:'Save settings',saving:'Saving…',saved:'Settings saved',fail:'Save failed',req_fail:'Request failed: ',no_keys:'No host keys yet. They appear after the first SSH connection.',no_machines:'No machines to reset',delete_key:'Delete',delete_confirm:'Delete the trusted key for {1}? The next connection will trust a new key; verify the host first.',reset_confirm:'Reset task order for {1}?',done:'Done',backup_exists:'config.toml.bak exists'}
 };
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -2985,7 +3760,7 @@ function T(k,...a){let s=(D[LANG]||D.zh)[k]||D.zh[k]||k;a.forEach((v,i)=>s=s.spl
 function applyLang(){document.querySelectorAll('[data-i18n]').forEach(el=>el.textContent=T(el.dataset.i18n));document.querySelectorAll('[data-i18n-ph]').forEach(el=>el.placeholder=T(el.dataset.i18nPh));document.documentElement.lang=LANG==='en'?'en':'zh-CN';document.title=LANG==='en'?'ARTEX · Settings':'ARTEX · 设置';renderHosts()}
 function applyTheme(theme){document.body.classList.toggle('dark',theme==='dark');try{localStorage.setItem('artex_theme',theme==='dark'?'1':'0')}catch(e){}}
 async function api(path,body){const r=await fetch(path,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});return await r.json()}
-const keys=['lang','theme','refresh_seconds','background_refresh_seconds','auto_connect','desktop_notifications','timeout_minutes','plan_heartbeat_minutes','llm','test_prefix','coverage_enabled','seed_first_intent','goal','default_artex_port','ssh_timeout','reconnect_seconds','login_user','login_password','auto_reconnect','export_dir'];
+const keys=['lang','theme','refresh_seconds','background_refresh_seconds','auto_connect','desktop_notifications','timeout_minutes','plan_heartbeat_minutes','llm','test_prefix','coverage_enabled','seed_first_intent','goal','desc_template','default_artex_port','ssh_timeout','reconnect_seconds','login_user','login_password','auto_reconnect','export_dir'];
 function fill(d){SETTINGS=d;LANG=d.lang==='en'?'en':'zh';keys.forEach(k=>{const el=$(k);if(!el)return;if(el.type==='checkbox')el.checked=!!d[k];else el.value=d[k]==null?'':d[k]});$('order-machine').innerHTML=(d.machines||[]).map(m=>'<option value="'+esc(m.ip)+'">'+esc(m.ip)+(m.label?' · '+esc(m.label):'')+'</option>').join('')||'<option value="">'+esc(T('no_machines'))+'</option>';$('backup-state').textContent=d.config_backup_exists?T('backup_exists'):'';applyLang()}
 async function load(){try{fill(await api('/api/settings'))}catch(e){$('msg').textContent=T('req_fail')+e}}
 function renderHosts(){const items=SETTINGS.host_keys||[];$('host-keys').innerHTML=items.length?items.map(h=>'<div class="host"><div class="fp"><b>'+esc(h.tag)+'</b><code title="'+esc(h.fingerprint)+'">'+esc(h.fingerprint)+'</code></div><button class="ghost danger del-key" data-tag="'+esc(h.tag)+'">'+esc(T('delete_key'))+'</button></div>').join(''):'<div class="empty">'+esc(T('no_keys'))+'</div>';document.querySelectorAll('.del-key').forEach(b=>b.onclick=()=>maintenance('delete_host_key',{tag:b.dataset.tag},T('delete_confirm',b.dataset.tag)))}
@@ -3062,6 +3837,7 @@ class Handler(BaseHTTPRequestHandler):
                               "key_file": m.get("ssh_key_file", "")}
                              for m in self.cfg["machines"]],
                 "goal": (d.get("goal") or "").strip() or DEFAULT_GOAL,
+                "desc_template": (d.get("desc_template") or "").strip() or DEFAULT_DESC_TEMPLATE,
                 "timeout_minutes": int(d.get("timeout_minutes", 600)),
                 "llm_key": d.get("llm", ""),
                 "login_user": d.get("login_user", ""),
@@ -3096,6 +3872,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if self.path.startswith("/api/ws/download"):
+            self._serve_download()
             return
         if self.path in ("/", "/index.html"):
             body = HTML.encode("utf-8")
@@ -3177,6 +3956,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/api/task-info"):
             self._json(self._task_info(machine, pw, body))
+            return
+        if self.path.startswith("/api/ws/list"):
+            self._json(self._ws_list(machine, pw, body))
+            return
+        if self.path.startswith("/api/ws/stat"):
+            self._json(self._ws_stat(machine, pw, body))
+            return
+        if self.path.startswith("/api/ws/download"):
+            self._json(self._ws_download(machine, pw, body))
+            return
+        if self.path.startswith("/api/task-delete"):
+            self._json(self._task_delete(machine, pw, body))
             return
         if self.path.startswith("/api/ask"):
             self._json(self._ask(machine, pw, body))
@@ -3302,6 +4093,7 @@ class Handler(BaseHTTPRequestHandler):
             "seed_first_intent": bool(d.get("seed_first_intent", False)),
             "test_prefix": d.get("test_prefix", "[DISPATCH-TEST]"),
             "goal": d.get("goal", ""),
+            "desc_template": d.get("desc_template", ""),
             "machines": [{"ip": m["ip"], "label": m.get("label", "")}
                          for m in self.cfg["machines"]],
             "host_keys": [{"tag": k, "fingerprint": v}
@@ -3343,6 +4135,9 @@ class Handler(BaseHTTPRequestHandler):
         goal = str(body.get("goal") or "")
         if len(goal) > 100000:
             return {"ok": False, "error": "目标模板过长"}
+        desc_template = str(body.get("desc_template") or "")
+        if len(desc_template) > 100000:
+            return {"ok": False, "error": "描述模板过长"}
 
         c = self.cfg.setdefault("console", {})
         c.update(values)
@@ -3372,6 +4167,7 @@ class Handler(BaseHTTPRequestHandler):
             "seed_first_intent": bool(body.get("seed_first_intent")),
             "test_prefix": str(body.get("test_prefix") or ""),
             "goal": goal,
+            "desc_template": desc_template,
         })
         try:
             save_config(self.cfg)
@@ -3605,6 +4401,127 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:160])}
 
+    def _ws_list(self, machine, password, body):
+        try:
+            path = _ws_norm(body.get("path"))
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        try:
+            with client_ctx(self.cfg, machine, password) as c:
+                data = c.workspace_list(path)
+            entries = []
+            for e in data.get("entries") or []:
+                try:
+                    rel = _ws_norm(e.get("path"))
+                except ValueError:
+                    continue
+                entries.append({"name": str(e.get("name") or ""), "path": rel,
+                                "dir": bool(e.get("dir")), "size": int(e.get("size") or 0),
+                                "mtime": int(e.get("mtime") or 0)})
+            try:
+                cur = _ws_norm(data.get("path") or path)
+            except ValueError:
+                cur = path
+            return {"ok": True, "path": cur, "entries": entries}
+        except paramiko.AuthenticationException:
+            return {"ok": False, "error": "SSH 认证失败：密码不对"}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:200])}
+
+    def _ws_stat(self, machine, password, body):
+        tid = str(body.get("task_id") or "").strip()
+        if not tid.isdigit():
+            return {"ok": False, "error": "任务 id 无效"}
+        try:
+            with client_ctx(self.cfg, machine, password) as c:
+                stats = ws_task_stat(c, tid)
+            stats["ok"] = True
+            return stats
+        except paramiko.AuthenticationException:
+            return {"ok": False, "error": "SSH 认证失败：密码不对"}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:200])}
+
+    def _ws_download(self, machine, password, body):
+        paths = body.get("paths")
+        if not isinstance(paths, list) or not paths:
+            return {"ok": False, "error": "没有选中文件"}
+        try:
+            with Session(self.cfg, machine, password) as c:
+                tmp, name, size = prepare_workspace_download(c, paths)
+        except paramiko.AuthenticationException:
+            return {"ok": False, "error": "SSH 认证失败：密码不对"}
+        except (ValueError, RuntimeError) as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:200])}
+        ticket = uuid.uuid4().hex
+        _download_cleanup()
+        with _DOWNLOAD_LOCK:
+            _DOWNLOAD_TICKETS[ticket] = {"path": tmp, "name": name, "size": size,
+                                         "created": time.time()}
+        return {"ok": True, "id": ticket, "name": name, "size": size}
+
+    def _serve_download(self):
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        ticket = (q.get("id") or [""])[0]
+        _download_cleanup()
+        with _DOWNLOAD_LOCK:
+            item = _DOWNLOAD_TICKETS.pop(ticket, None)
+        if not item or time.time() - item.get("created", 0) > _DOWNLOAD_TTL:
+            if item:
+                try:
+                    os.remove(item["path"])
+                except Exception:
+                    pass
+            self._json({"ok": False, "error": "下载已过期，请重新打包"}, 404)
+            return
+        path = item["path"]
+        try:
+            name = str(item.get("name") or os.path.basename(path))
+            ascii_name = (re.sub(r"[^0-9A-Za-z._-]", "_", name) or "download")[:120]
+            quoted = urllib.parse.quote(name)
+            size = os.path.getsize(path)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition",
+                             'attachment; filename="%s"; filename*=UTF-8\'\'%s'
+                             % (ascii_name, quoted))
+            self.send_header("Content-Length", str(size))
+            self._common_headers()
+            self.end_headers()
+            with open(path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile, 256 * 1024)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            pass
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+    def _task_delete(self, machine, password, body):
+        tid = str(body.get("task_id") or "").strip()
+        if not tid.isdigit():
+            return {"ok": False, "error": "任务 id 无效"}
+        opts = {key: bool(body.get(key)) for key in
+                ("delete_files", "delete_assets", "delete_traffic",
+                 "delete_findings", "delete_llm_records")}
+        try:
+            with client_ctx(self.cfg, machine, password) as c:
+                st, res = c.delete_task(tid, opts)
+            if st == 200:
+                drop_task_state(machine["ip"], tid)
+                return {"ok": True, "result": res or {}}
+            return {"ok": False, "error": "HTTP %s：%s"
+                    % (st, str((res or {}).get("error") or res)[:200])}
+        except paramiko.AuthenticationException:
+            return {"ok": False, "error": "SSH 认证失败：密码不对"}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:200])}
+
     def _ask(self, machine, password, body):
         """给某任务的主 Agent 发消息，并把回复取回来。"""
         tid = str(body.get("task_id") or "").strip()
@@ -3644,7 +4561,8 @@ class Handler(BaseHTTPRequestHandler):
                 return {"ok": False, "error": "继承任务时，描述和目标必须填写"}
         else:
             if not desc:
-                desc = "渗透%s源站及其子站" % name
+                tpl = (d.get("desc_template") or "").strip() or DEFAULT_DESC_TEMPLATE
+                desc = tpl.replace("<名称>", name)
             if not goal_text:
                 goal_text = (d.get("goal") or "").strip() or DEFAULT_GOAL
 
